@@ -25,6 +25,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiohttp import web
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
@@ -578,6 +579,21 @@ async def configure_bot_commands():
             ],
             scope=BotCommandScopeChat(chat_id=aid),
         )
+
+
+async def start_health_server():
+    async def health(_request):
+        return web.Response(text="Razor Stars Bot is running")
+
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "8765"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    return runner
 
 
 @dp.message(CommandStart())
@@ -2008,6 +2024,7 @@ async def main():
     if not ADMIN_IDS:
         print("ADMIN_IDS не задано: надішліть боту /id, додайте ID в ADMIN_IDS і перезапустіть бота.")
     await configure_bot_commands()
+    await start_health_server()
     await dp.start_polling(bot)
 
 
