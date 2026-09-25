@@ -1,0 +1,1 @@
+# Spanix Stars Bot
