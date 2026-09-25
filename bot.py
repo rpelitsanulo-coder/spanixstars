@@ -3537,30 +3537,12 @@ async def nft_add_start(call: CallbackQuery, state: FSMContext):
     )
 
 
-@dp.message(Form.nft_add_wait_emoji, F.sticker)
-async def nft_receive_sticker(message: Message, state: FSMContext):
+@dp.message(Form.nft_add_wait_emoji)
+async def nft_receive_emoji(message: Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
         return
-    await state.update_data(
-        sticker_file_id=message.sticker.file_id,
-        sticker_type="sticker",
-        custom_emoji_id=None,
-        nft_emoji=message.sticker.emoji or "🎁",
-    )
-    await state.set_state(Form.nft_add_details)
-    await message.answer(
-        "✅ NFT-стікер отримано.\n\n"
-        "Тепер надішліть одним повідомленням:\n"
-        "<code>Назва | ціна | опис</code>\n\n"
-        "Наприклад:\n"
-        "<code>Gift #1 | 350 | Опис подарунка</code>"
-    )
 
-
-@dp.message(Form.nft_add_wait_emoji, F.text)
-async def nft_receive_custom_emoji(message: Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
-        return
+    sticker = message.sticker
     custom_emoji_id = next(
         (
             entity.custom_emoji_id
@@ -3569,30 +3551,60 @@ async def nft_receive_custom_emoji(message: Message, state: FSMContext):
         ),
         None,
     )
-    if not custom_emoji_id:
+
+    if sticker:
+        custom_emoji_id = custom_emoji_id or getattr(sticker, "custom_emoji_id", None)
+        sticker_type = getattr(sticker, "type", "")
+        if custom_emoji_id or sticker_type == "custom_emoji":
+            await state.update_data(
+                sticker_file_id=None,
+                sticker_type=None,
+                custom_emoji_id=custom_emoji_id,
+                nft_emoji=sticker.emoji or "🎁",
+            )
+            received_text = "✅ Premium Emoji отримано."
+        else:
+            await state.update_data(
+                sticker_file_id=sticker.file_id,
+                sticker_type="sticker",
+                custom_emoji_id=None,
+                nft_emoji=sticker.emoji or "🎁",
+            )
+            received_text = "✅ NFT-стікер отримано."
+    elif custom_emoji_id:
+        await state.update_data(
+            sticker_file_id=None,
+            sticker_type=None,
+            custom_emoji_id=custom_emoji_id,
+            nft_emoji=(message.text or "").strip() or "🎁",
+        )
+        received_text = "✅ Premium Emoji отримано."
+    elif message.text and message.text.strip() and len(message.text.strip()) <= 16 and not any(
+        character.isalnum() for character in message.text.strip()
+    ):
+        # Some Telegram clients send a plain emoji without preserving the
+        # custom_emoji entity. Keep the visible emoji instead of rejecting it.
+        await state.update_data(
+            sticker_file_id=None,
+            sticker_type=None,
+            custom_emoji_id=None,
+            nft_emoji=message.text.strip(),
+        )
+        received_text = "✅ Emoji отримано."
+    else:
         await message.answer(
-            "❌ Не бачу Premium Emoji.\nНадішліть NFT-стікер або Telegram Premium Emoji."
+            "❌ Не бачу емодзі.\nНадішліть Premium Emoji, custom-emoji sticker або звичайний emoji."
         )
         return
-    await state.update_data(
-        sticker_file_id=None,
-        sticker_type=None,
-        custom_emoji_id=custom_emoji_id,
-        nft_emoji=message.text.strip() or "🎁",
-    )
+
     await state.set_state(Form.nft_add_details)
     await message.answer(
-        "✅ Premium Emoji NFT отримано.\n\n"
+        f"{received_text}\n\n"
         "Тепер надішліть одним повідомленням:\n"
         "<code>Назва | ціна | опис</code>\n\n"
         "Наприклад:\n"
         "<code>Gift #1 | 350 | Опис подарунка</code>"
     )
-
-
-@dp.message(Form.nft_add_wait_emoji)
-async def nft_expected_custom_emoji(message: Message):
-    await message.answer("❌ Надішліть NFT-стікер або Telegram Premium Emoji.")
 
 
 @dp.message(Form.nft_add_details)
