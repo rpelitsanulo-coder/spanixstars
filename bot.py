@@ -1,14 +1,20 @@
 import asyncio
+import csv
+import difflib
 import html
+import json
 import os
 import re
+import secrets
 import sqlite3
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ContentType
+from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -17,6 +23,7 @@ from aiogram.types import (
     BotCommandScopeAllPrivateChats,
     BotCommandScopeChat,
     CallbackQuery,
+    ErrorEvent,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -30,17 +37,25 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {
-    8759868224,
-    *(
-        int(x.strip())
-        for x in os.getenv("ADMIN_IDS", "").split(",")
-        if x.strip().isdigit()
-    ),
+    int(x) for x in re.split(
+        r"[\s,;]+", os.getenv("ADMIN_IDS") or "8759868224"
+    ) if x.isdigit()
 }
-BOT_NAME = "Razor Stars"
-DB_PATH = os.getenv("DB_PATH", str(Path(__file__).resolve().with_name("bot.db")))
+for _admin_env_name in ("ADMIN_ID", "OWNER_ID"):
+    _admin_env_value = os.getenv(_admin_env_name, "").strip()
+    if _admin_env_value.isdigit():
+        ADMIN_IDS.add(int(_admin_env_value))
+BOT_NAME = "Spanix Stars"
+PROJECT_DIR = Path(__file__).resolve().parent
+DB_PATH = os.getenv("DB_PATH", str(PROJECT_DIR / "bot.db")).strip()
+if DB_PATH != ":memory:":
+    db_file = Path(DB_PATH).expanduser()
+    if not db_file.is_absolute():
+        db_file = PROJECT_DIR / db_file
+    db_file.parent.mkdir(parents=True, exist_ok=True)
+    DB_PATH = str(db_file.resolve())
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "@support")
 REVIEWS_URL = os.getenv("REVIEWS_URL", "https://t.me/")
 
@@ -51,6 +66,18 @@ BANK_DETAILS = {
     "alliance": os.getenv("ALLIANCE_DETAILS", "Реквізити Альянс не налаштовані."),
     "abank": os.getenv("ABANK_DETAILS", "Реквізити А-Банк не налаштовані."),
 }
+
+# One source of truth for the banks shown to customers and administrators.
+# The same keys are used by payment_method, settings and receipt validation.
+BANK_OPTIONS = (
+    ("Privat24", "private", "ПриватБанк"),
+    ("Mono", "mono", "Monobank"),
+    ("PUMB", "pumb", "ПУМБ"),
+    ("Альянс", "alliance", "Альянс Банк"),
+    ("А-Банк", "abank", "А-Банк"),
+)
+
+BANK_DISPLAY_NAMES = {code: display for _, code, display in BANK_OPTIONS}
 
 MAIN_EMOJI = {
     "buy_stars": "5848021027782661221",
@@ -118,6 +145,748 @@ def normalize_reviews_url(raw_value: str):
     return None
 
 
+def _compact_spaces(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip(" \t:;-")
+
+
+def _label_value(lines, labels, start=0, end=None):
+    """Find a value on the same line as a label or on the following line."""
+    end = len(lines) if end is None else end
+    aliases = sorted((label.lower() for label in labels), key=len, reverse=True)
+    for index in range(start, end):
+        line = _compact_spaces(lines[index])
+        lowered = line.lower()
+        for label in aliases:
+            if not lowered.startswith(label):
+                continue
+            remainder = line[len(label):].lstrip(" \t:;-")
+            if remainder:
+                return remainder
+            for next_index in range(index + 1, min(index + 3, end)):
+                value = _compact_spaces(lines[next_index])
+                if value:
+                    return value
+    return ""
+
+
+def _section_bounds(lines, section_labels, next_section_labels):
+    start = next((i for i, line in enumerate(lines) if any(
+        label in line.lower() for label in section_labels
+    )), None)
+    if start is None:
+        return 0, len(lines)
+    end = next(
+        (i for i in range(start + 1, len(lines))
+         if any(label in lines[i].lower() for label in next_section_labels)),
+        len(lines),
+    )
+    return start, end
+
+
+def _number(value):
+    if not value:
+        return ""
+    match = re.search(r"(?<!\d)(\d[\d\s]*(?:[.,]\d{1,2})?)(?!\d)", value)
+    if not match:
+        return ""
+    return match.group(1).replace(" ", "").replace(",", ".")
+
+
+def _text_value(value):
+    """Remove OCR punctuation around a text field without destroying its value."""
+    return _compact_spaces(value).strip(" .,:;|-")
+
+
+def _identifier(value):
+    """Keep receipt identifiers readable while removing common OCR separators."""
+    return _text_value(value).replace("№", "").strip()
+
+
+def _find_value_by_patterns(text, patterns):
+    """Return the first value captured by one of several label patterns."""
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+        if match:
+            value = _text_value(match.group(1))
+            if value:
+                return value
+    return ""
+
+
+def _bank_method_match(expected_method, detected_bank):
+    """Classify a receipt bank against the bank selected before payment."""
+    expected_aliases = {
+        "private": ("privat", "приват", "приват24"),
+        "mono": ("mono", "монобанк", "monobank"),
+        "pumb": ("pumb", "пумб"),
+        "alliance": ("alliance", "альянс"),
+        "abank": ("a-bank", "a bank", "абанк", "а-банк"),
+    }.get(expected_method, ())
+    if not expected_method:
+        return ""
+    if not detected_bank:
+        return "Банк не визначено"
+    detected_key = _bank_key(detected_bank)
+    if any(_bank_key(alias) in detected_key or detected_key in _bank_key(alias)
+           for alias in expected_aliases):
+        return "Збігається"
+    return "Не збігається"
+
+
+def _amount_match(receipt_amount, order_amount):
+    """Compare a parsed receipt amount to the amount of the current order."""
+    if not receipt_amount or order_amount in (None, ""):
+        return ""
+    try:
+        receipt_value = round(float(str(receipt_amount).replace(",", ".")), 2)
+        order_value = round(float(order_amount), 2)
+    except (TypeError, ValueError):
+        return "Не вдалося перевірити"
+    return "Збігається" if receipt_value == order_value else "Не збігається"
+
+
+def _is_payment_system(value):
+    return bool(re.fullmatch(
+        r"(visa|mastercard|maestro|amex|мир|віза|master card)",
+        value.strip(),
+        re.IGNORECASE,
+    ))
+
+
+def _is_money_line(value):
+    return bool(re.fullmatch(r"\d{1,6}(?:[.,]\d{1,2})?", value.replace(" ", "")))
+
+
+RECEIPT_BANK_MARKERS = (
+    # Ukrainian banks and the names commonly printed on their receipts.
+    # Keep aliases compact and include the names used by mobile banking apps:
+    # OCR often drops spaces, hyphens, quotes, or the "АТ" prefix.
+    ("monobank", "Monobank"),
+    ("mono", "Monobank"),
+    ("mono bank", "Monobank"),
+    ("приватбанк", "ПриватБанк"),
+    ("privatbank", "PrivatBank"),
+    ("приват банк", "ПриватБанк"),
+    ("приват24", "Privat24"),
+    ("privat24", "Privat24"),
+    ("пумб", "ПУМБ"),
+    ("pumb", "PUMB"),
+    ("pumb bank", "PUMB"),
+    ("а-банк", "А-Банк"),
+    ("а банк", "А-Банк"),
+    ("a-bank", "A-Bank"),
+    ("a bank", "A-Bank"),
+    ("абанк", "А-Банк"),
+    ("альянс", "Альянс Банк"),
+    ("alliance bank", "Alliance Bank"),
+    ("ощадбанк", "Ощадбанк"),
+    ("oschadbank", "Oschadbank"),
+    ("райффайзен", "Райффайзен Банк"),
+    ("raiffeisen", "Raiffeisen Bank"),
+    ("райф", "Райффайзен Банк"),
+    ("сенс банк", "Sense Bank"),
+    ("sense bank", "Sense Bank"),
+    ("сенсбанк", "Sense Bank"),
+    ("sensebank", "Sense Bank"),
+    ("альфа-банк", "Альфа-Банк"),
+    ("alfabank", "Alfa Bank"),
+    ("укрсиббанк", "УкрСиббанк"),
+    ("ukrsibbank", "Ukrsibbank"),
+    ("укрсиб", "УкрСиббанк"),
+    ("укргазбанк", "Укргазбанк"),
+    ("ukrgasbank", "Ukrgasbank"),
+    ("укрексімбанк", "Укрексімбанк"),
+    ("укрэксимбанк", "Укрэксимбанк"),
+    ("ukreximbank", "Ukreximbank"),
+    ("otp bank", "OTP Bank"),
+    ("otp банк", "OTP Bank"),
+    ("отп банк", "OTP Bank"),
+    ("креді агріколь", "Credit Agricole"),
+    ("креди агриколь", "Credit Agricole"),
+    ("credit agricole", "Credit Agricole"),
+    ("універсал банк", "Універсал Банк"),
+    ("universal bank", "Universal Bank"),
+    ("універсалбанк", "Універсал Банк"),
+    ("universalbank", "Universal Bank"),
+    ("таскомбанк", "ТАСКОМБАНК"),
+    ("taskombank", "Tascombank"),
+    ("кредобанк", "Кредобанк"),
+    ("kredobank", "KredoBank"),
+    ("банк кредит дніпро", "Банк Кредит Дніпро"),
+    ("credit dnipro", "Credit Dnipro"),
+    ("про kredit", "ProCredit Bank"),
+    ("procredit", "ProCredit Bank"),
+    ("ідея банк", "Ідея Банк"),
+    ("idea bank", "Idea Bank"),
+    ("піреус", "Піреус Банк"),
+    ("piraeus", "Piraeus Bank"),
+    ("банк восток", "Банк Восток"),
+    ("bank vostok", "Bank Vostok"),
+    ("банк львів", "Банк Львів"),
+    ("bank lviv", "Bank Lviv"),
+    ("мтб банк", "МТБ БАНК"),
+    ("mtb bank", "MTB Bank"),
+    ("izibank", "izibank"),
+    ("izi банк", "izibank"),
+    ("ізібанк", "izibank"),
+    ("іsіbank", "izibank"),
+    ("бісбанк", "BISBANK"),
+    ("bisbank", "BISBANK"),
+    ("банк альянс", "Альянс Банк"),
+    ("банк інвестицій та заощаджень", "Банк інвестицій та заощаджень"),
+    ("банк інвестицій", "Банк інвестицій та заощаджень"),
+    ("бізбанк", "БІЗБАНК"),
+    ("глобус банк", "Глобус Банк"),
+    ("globus bank", "Globus Bank"),
+    ("глобусбанк", "Глобус Банк"),
+    ("необанк", "NEOBANK"),
+    ("neobank", "NEOBANK"),
+    ("юнекс банк", "Юнекс Банк"),
+    ("unex bank", "Unex Bank"),
+    ("юникс банк", "Юнекс Банк"),
+    ("правекс банк", "Правекс Банк"),
+    ("pravex bank", "Pravex Bank"),
+    ("індустріалбанк", "Індустріалбанк"),
+    ("industrialbank", "Industrialbank"),
+    ("кристалбанк", "Кристалбанк"),
+    ("crystalbank", "CrystalBank"),
+    ("комінбанк", "COMINBANK"),
+    ("cominbank", "COMINBANK"),
+    ("мегабанк", "МЕГАБАНК"),
+    ("megabank", "MEGABANK"),
+    ("банк південний", "Банк Південний"),
+    ("bank pivdennyi", "Bank Pivdennyi"),
+    ("південний", "Банк Південний"),
+    ("мiжнародний інвестиційний банк", "МІБ"),
+    ("міжнародний інвестиційний банк", "МІБ"),
+    ("mib", "MIB"),
+    ("сredit agricole", "Credit Agricole"),
+    ("сredit agricole", "Credit Agricole"),
+    ("кредитвест банк", "Кредитвест Банк"),
+    ("creditwest bank", "Creditwest Bank"),
+    ("банк 3/4", "Банк 3/4"),
+    ("банк три чверті", "Банк 3/4"),
+    ("сhіпабанк", "Чінабaнк"),
+    ("чинaбанк", "Чінабaнк"),
+    ("china construction bank", "China Construction Bank"),
+    ("сітібанк", "Citibank"),
+    ("citibank", "Citibank"),
+    ("деutsche bank", "Deutsche Bank"),
+    ("deutsche bank", "Deutsche Bank"),
+    ("юсіb", "USB"),
+    ("укркапітал", "Український капітал"),
+    ("український капітал", "Український капітал"),
+    ("ukrcapital", "Ukrainian Capital Bank"),
+)
+
+
+def _bank_key(value):
+    """Normalize a bank name for OCR-tolerant matching."""
+    value = str(value or "").lower()
+    # OCR may mix visually similar Latin/Cyrillic characters in one word.
+    value = value.translate(str.maketrans({
+        "а": "a", "е": "e", "і": "i", "ї": "i", "є": "e",
+        "о": "o", "р": "p", "с": "c", "у": "y", "х": "x",
+    }))
+    return re.sub(r"[^a-z0-9а-яіїєґ]", "", value)
+
+
+def _bank_alias_matches(alias, normalized_text, lines):
+    alias_key = _bank_key(alias)
+    if not alias_key:
+        return False
+    if alias_key in normalized_text:
+        return True
+
+    # A short OCR typo (for example "monobark") should not turn a receipt
+    # into an unknown bank. Only use fuzzy matching for longer aliases and
+    # compare individual OCR words to avoid matching a whole unrelated line.
+    if len(alias_key) < 7:
+        return False
+    for line in lines:
+        for word in re.findall(r"[a-zа-яіїєґ0-9]{5,}", line.lower()):
+            word_key = _bank_key(word)
+            if abs(len(word_key) - len(alias_key)) > 2:
+                continue
+            if difflib.SequenceMatcher(None, alias_key, word_key).ratio() >= 0.84:
+                return True
+    return False
+
+
+def _detect_receipt_bank(lines, raw_text):
+    """Return a known bank name or a bank name read directly by OCR."""
+    normalized_text = _bank_key(raw_text)
+    for marker, bank_name in RECEIPT_BANK_MARKERS:
+        if _bank_alias_matches(marker, normalized_text, lines):
+            return bank_name
+
+    # Keep working with a bank not listed above. Do not mistake field labels
+    # such as "Банк одержувача" for the bank itself.
+    ignored = (
+        "банк одержувача", "банк получателя", "банк відправника",
+        "банк отправителя", "код банку", "bank code", "recipient bank",
+        "sender bank",
+    )
+    for line in lines:
+        lowered = line.lower()
+        if ("банк" in lowered or "bank" in lowered) and not any(
+            label in lowered for label in ignored
+        ):
+            return line
+    return ""
+
+
+def _parse_columnar_receipt(lines, result):
+    """Handle bank receipts where OCR reads the left column before the right."""
+    bank_code_index = next(
+        (
+            i for i, line in enumerate(lines)
+            if re.fullmatch(r"\d{6}", line.replace(" ", ""))
+        ),
+        None,
+    )
+    if bank_code_index is None or bank_code_index < 2:
+        return
+
+    sender_bank = lines[bank_code_index - 1]
+    sender_name = lines[bank_code_index - 2]
+    if "банк" not in sender_bank.lower() and "bank" not in sender_bank.lower():
+        return
+
+    result["sender_name"] = sender_name
+    result["sender_bank"] = sender_bank
+    result["sender_bank_code"] = lines[bank_code_index].replace(" ", "")
+
+    sender_payment_index = next(
+        (i for i in range(bank_code_index + 1, min(bank_code_index + 5, len(lines)))
+         if _is_payment_system(lines[i])),
+        None,
+    )
+    if sender_payment_index is None:
+        return
+    result["sender_payment_system"] = lines[sender_payment_index]
+
+    receiver_bank_index = next(
+        (
+            i for i in range(sender_payment_index + 2, len(lines))
+            if ("банк" in lines[i].lower() or "bank" in lines[i].lower())
+            and "код" not in lines[i].lower()
+        ),
+        None,
+    )
+    if receiver_bank_index is None or receiver_bank_index < sender_payment_index + 2:
+        return
+    receiver_name_index = receiver_bank_index - 1
+    result["receiver_name"] = lines[receiver_name_index]
+    result["receiver_bank"] = lines[receiver_bank_index]
+
+    receiver_payment_index = next(
+        (i for i in range(receiver_bank_index + 1, min(receiver_bank_index + 4, len(lines)))
+         if _is_payment_system(lines[i])),
+        None,
+    )
+    if receiver_payment_index is None:
+        return
+    result["receiver_payment_system"] = lines[receiver_payment_index]
+
+    sender_instrument_lines = lines[sender_payment_index + 1:receiver_name_index]
+    if sender_instrument_lines:
+        result["sender_instrument"] = " ".join(sender_instrument_lines)
+
+    receiver_instrument_index = receiver_payment_index + 1
+    if receiver_instrument_index < len(lines):
+        result["receiver_instrument"] = lines[receiver_instrument_index]
+
+    amount_index = next(
+        (
+            i for i in range(receiver_instrument_index + 1, len(lines))
+            if re.fullmatch(r"\d{1,6}[.,]\d{1,2}", lines[i].replace(" ", ""))
+        ),
+        None,
+    )
+    if amount_index is None:
+        return
+    result["amount"] = lines[amount_index].replace(" ", "").replace(",", ".")
+
+    fee_index = next(
+        (i for i in range(amount_index + 1, min(amount_index + 4, len(lines)))
+         if _is_money_line(lines[i])),
+        None,
+    )
+    if fee_index is not None:
+        result["fee"] = lines[fee_index].replace(" ", "").replace(",", ".")
+        if result["fee"] in {"0", "00", "000"}:
+            result["fee"] = "0.00"
+
+    date_index = next(
+        (
+            i for i in range(amount_index + 1, len(lines))
+            if re.fullmatch(
+                r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\s+\d{1,2}:\d{2}(?::\d{2})?",
+                lines[i],
+            )
+        ),
+        None,
+    )
+    auth_index = next(
+        (
+            i for i in range((fee_index or amount_index) + 1, len(lines))
+            if re.fullmatch(r"\d{6}", lines[i].replace(" ", ""))
+        ),
+        None,
+    )
+    if auth_index is not None:
+        result["authorization_code"] = lines[auth_index].replace(" ", "")
+    if date_index is not None:
+        result["operation_datetime"] = lines[date_index]
+        if auth_index is not None and auth_index < date_index:
+            purpose_lines = [
+                line for line in lines[auth_index + 1:date_index]
+                if line and "сум" not in line.lower() and len(line) > 2
+            ]
+            if purpose_lines:
+                result["payment_purpose"] = " ".join(purpose_lines)
+        if date_index + 1 < len(lines):
+            result["device_id"] = lines[date_index + 1].rstrip(":")
+
+
+def parse_receipt_text(raw_text):
+    """Extract common receipt fields while keeping the original OCR text."""
+    text = raw_text or ""
+    lines = [_compact_spaces(line) for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    lower_text = text.lower()
+    result = {
+        "ocr_status": "Розпізнано" if lines else "Потрібна перевірка",
+        "receipt_number": "",
+        "bank": "",
+        "transaction_id": "",
+        "operation_id": "",
+        "rrn": "",
+        "status": "",
+        "operation_datetime": "",
+        "currency": "",
+        "sender_name": "",
+        "sender_bank": "",
+        "sender_bank_code": "",
+        "sender_account": "",
+        "sender_card": "",
+        "sender_payment_system": "",
+        "sender_instrument": "",
+        "receiver_name": "",
+        "receiver_bank": "",
+        "receiver_bank_code": "",
+        "receiver_account": "",
+        "receiver_card": "",
+        "receiver_payment_system": "",
+        "receiver_instrument": "",
+        "amount": "",
+        "fee": "",
+        "total_amount": "",
+        "authorization_code": "",
+        "payment_purpose": "",
+        "comment": "",
+        "merchant": "",
+        "device_id": "",
+    }
+
+    receipt_line = _label_value(lines, (
+        "квитанція", "квитанция", "receipt number", "receipt no", "receipt №",
+    ))
+    if receipt_line:
+        number_match = re.search(
+            r"(?:№|no\.?)\s*([A-Za-zА-Яа-яІіЇїЄє0-9][A-Za-zА-Яа-яІіЇїЄє0-9/_-]*)",
+            receipt_line,
+            re.IGNORECASE,
+        )
+        result["receipt_number"] = number_match.group(1) if number_match else receipt_line
+
+    result["bank"] = _detect_receipt_bank(lines, lower_text)
+
+    # Bank apps use different names for the same identifiers. Parse these
+    # before sender/receiver sections so compact receipts are covered too.
+    result["transaction_id"] = _identifier(_label_value(lines, (
+        "ідентифікатор транзакції", "идентификатор транзакции",
+        "transaction id", "transaction number", "номер транзакції",
+        "номер транзакции", "номер операції", "номер операции",
+    )))
+    result["operation_id"] = _identifier(_label_value(lines, (
+        "id операції", "id операции", "operation id", "операція id",
+        "операция id", "reference", "референс", "референс платежу",
+    )))
+    result["rrn"] = _identifier(_label_value(lines, (
+        "rrn", "retrieval reference number", "код трансакції",
+        "код транзакції", "код транзакции",
+    )))
+    result["status"] = _text_value(_label_value(lines, (
+        "статус платежу", "статус платежа", "payment status", "status",
+    )))
+    result["currency"] = _text_value(_label_value(lines, (
+        "валюта", "currency", "валюта операції", "валюта платежу",
+    )))
+
+    result["operation_datetime"] = _label_value(lines, (
+        "дата та час операції", "дата і час операції", "дата операції",
+        "дата платежу", "дата и время операции", "transaction date",
+        "дата переказу", "дата перевода", "created at",
+    ))
+    if not result["operation_datetime"]:
+        date_match = re.search(
+            r"\b(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\s+\d{1,2}:\d{2}(?::\d{2})?)\b"
+            r"|\b(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})\b",
+            text,
+        )
+        if date_match:
+            result["operation_datetime"] = date_match.group(1) or date_match.group(2)
+
+    sender_start, sender_end = _section_bounds(
+        lines,
+        ("відправник", "отправитель", "sender", "payer"),
+        ("одержувач", "получатель", "receiver", "recipient", "деталі транзакції",
+         "детали операции", "transaction details"),
+    )
+    receiver_start, receiver_end = _section_bounds(
+        lines,
+        ("одержувач", "получатель", "receiver", "recipient"),
+        ("деталі транзакції", "детали операции", "transaction details"),
+    )
+    sender = (
+        ("sender_name", ("ім'я", "ім’я", "имя", "name")),
+        ("sender_bank", ("банк відправника", "банк отправителя", "sender bank", "bank")),
+        ("sender_bank_code", ("код банку", "bank code")),
+        ("sender_account", (
+            "рахунок відправника", "счет отправителя", "sender account",
+            "рахунок платника", "счет плательщика", "payer account",
+            "iban відправника", "iban отправителя",
+        )),
+        ("sender_card", (
+            "картка відправника", "карта отправителя", "sender card",
+            "картка платника", "карта плательщика", "payer card",
+        )),
+        ("sender_payment_system", ("платіжна система", "платежная система", "payment system")),
+        ("sender_instrument", ("платіжний інструмент", "платежный инструмент", "payment instrument")),
+    )
+    for key, labels in sender:
+        result[key] = _label_value(lines, labels, sender_start, sender_end)
+
+    receiver = (
+        ("receiver_name", ("ім'я", "ім’я", "имя", "name")),
+        ("receiver_bank", ("банк одержувача", "банк получателя", "recipient bank", "bank")),
+        ("receiver_bank_code", ("код банку одержувача", "код банка получателя", "recipient bank code")),
+        ("receiver_account", (
+            "рахунок одержувача", "счет получателя", "receiver account",
+            "рахунок отримувача", "счет получателя", "recipient account",
+            "iban одержувача", "iban получателя",
+        )),
+        ("receiver_card", (
+            "картка одержувача", "карта получателя", "receiver card",
+            "картка отримувача", "карта получателя", "recipient card",
+        )),
+        ("receiver_payment_system", ("платіжна система", "платежная система", "payment system")),
+        ("receiver_instrument", ("платіжний інструмент", "платежный инструмент", "payment instrument")),
+    )
+    for key, labels in receiver:
+        result[key] = _label_value(lines, labels, receiver_start, receiver_end)
+
+    # Mobile receipts frequently put the party name directly after the label
+    # instead of creating a separate "sender" section.
+    if not result["sender_name"]:
+        result["sender_name"] = _label_value(lines, (
+            "відправник", "отправитель", "sender", "payer",
+            "платник", "плательщик",
+        ))
+    if not result["receiver_name"]:
+        result["receiver_name"] = _label_value(lines, (
+            "одержувач", "получатель", "receiver", "recipient",
+            "отримувач", "получатель платежа", "одержувач платежу",
+        ))
+
+    result["amount"] = _number(_label_value(lines, (
+        "сума (грн)", "сума платежу", "сумма (грн)", "сумма платежа",
+        "сума", "сумма", "amount", "payment amount",
+    )))
+    result["fee"] = _number(_label_value(lines, (
+        "комісія (грн)", "комиссия (грн)", "комісія", "комиссия", "fee",
+    )))
+    result["total_amount"] = _number(_label_value(lines, (
+        "сума з комісією", "сумма с комиссией", "total amount", "total",
+    )))
+    result["authorization_code"] = _label_value(lines, (
+        "код авторизації", "код авторизации", "authorization code", "auth code",
+    ))
+    result["payment_purpose"] = _label_value(lines, (
+        "призначення платежу", "назначение платежа", "payment purpose", "description",
+        "призначення переказу", "назначение перевода", "деталі платежу",
+        "детали платежа",
+    ))
+    result["comment"] = _label_value(lines, (
+        "коментар", "комментарий", "comment", "примітка", "примечание",
+    ))
+    result["merchant"] = _label_value(lines, (
+        "торговець", "торговец", "merchant", "одержувач платежу",
+        "получатель платежа",
+    ))
+    result["device_id"] = _label_value(lines, (
+        "ідентифікатор платіжного пристрою", "идентификатор платежного устройства",
+        "device id", "terminal id",
+    ))
+
+    # Compact receipt variants often have no visible sender/receiver section.
+    compact_fields = {
+        "sender_account": ("рахунок платника", "счет плательщика", "payer account"),
+        "receiver_account": ("рахунок отримувача", "счет получателя", "recipient account"),
+        "sender_card": ("картка платника", "карта плательщика", "payer card"),
+        "receiver_card": ("картка отримувача", "карта получателя", "recipient card"),
+        "authorization_code": ("код авторизації", "код авторизации", "authorization code", "auth code"),
+    }
+    for key, labels in compact_fields.items():
+        if not result[key]:
+            result[key] = _label_value(lines, labels)
+
+    # Last-resort patterns for labelled identifiers and IBANs.
+    if not result["transaction_id"]:
+        result["transaction_id"] = _find_value_by_patterns(lower_text, (
+            r"(?:номер\s+(?:операції|операции|транзакції|транзакции)|"
+            r"transaction\s+(?:id|number))\s*[:№#-]?\s*([a-zа-яіїєґ0-9/_-]{4,})",
+        ))
+    if not result["rrn"]:
+        result["rrn"] = _find_value_by_patterns(lower_text, (
+            r"\brrn\s*[:#-]?\s*([a-z0-9-]{6,})",
+        ))
+    iban_match = re.search(r"\b([A-Z]{2}\d{2}[A-Z0-9]{11,30})\b", text, re.IGNORECASE)
+    if iban_match and not result["receiver_account"]:
+        result["receiver_account"] = iban_match.group(1).upper()
+    if not result["currency"]:
+        currency_match = re.search(
+            r"(?:сума|сумма|amount|total)\s*[:(]?[^\n]{0,40}?\b(UAH|грн|₴|USD|EUR)\b",
+            text,
+            re.IGNORECASE,
+        )
+        if currency_match:
+            result["currency"] = currency_match.group(1).upper()
+
+    # Some banks print all labels first and all values below them.
+    _parse_columnar_receipt(lines, result)
+
+    # Some banks print fields in a compact line without a visible label.
+    if not result["sender_bank_code"]:
+        result["sender_bank_code"] = _label_value(lines, ("код банку", "bank code"))
+    if not result["total_amount"] and result["amount"] and result["fee"] in {"0", "0.00"}:
+        result["total_amount"] = result["amount"]
+
+    found_values = sum(bool(value) for key, value in result.items() if key != "ocr_status")
+    if not found_values:
+        result["ocr_status"] = "Потрібна перевірка"
+    return result
+
+
+def ocr_receipt_file(path):
+    """OCR an image/PDF if optional OCR packages are installed."""
+    try:
+        from PIL import Image, ImageEnhance, ImageOps
+        import pytesseract
+    except ImportError:
+        return {}, "", "Для OCR потрібні пакети Pillow та pytesseract."
+
+    suffix = path.suffix.lower()
+    images = []
+    try:
+        if suffix == ".pdf":
+            try:
+                import fitz
+            except ImportError:
+                return {}, "", "Для OCR PDF потрібен пакет PyMuPDF."
+            pdf = fitz.open(path)
+            for page in pdf:
+                pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                images.append(Image.frombytes("RGB", [pixmap.width, pixmap.height], pixmap.samples))
+        else:
+            images.append(Image.open(path))
+    except Exception as exc:
+        return {}, "", f"Не вдалося відкрити файл квитанції: {exc}"
+
+    requested_languages = [
+        item.strip()
+        for item in os.getenv("TESSERACT_LANG", "ukr+rus+eng").split("+")
+        if item.strip()
+    ]
+    try:
+        installed_languages = set(pytesseract.get_languages(config=""))
+    except Exception:
+        installed_languages = set()
+    available_languages = [
+        language for language in requested_languages
+        if not installed_languages or language in installed_languages
+    ]
+    language = "+".join(available_languages) or "eng"
+    pages = []
+    for image in images:
+        try:
+            # Receipts use small grey text and bank logos. A second,
+            # high-contrast pass with a different page segmentation mode
+            # recovers bank names that a single OCR pass commonly misses.
+            prepared = ImageOps.autocontrast(ImageOps.grayscale(image))
+            prepared = ImageEnhance.Contrast(prepared).enhance(1.6)
+            if max(prepared.size) < 1800:
+                scale = 1800 / max(prepared.size)
+                prepared = prepared.resize(
+                    (int(prepared.width * scale), int(prepared.height * scale))
+                )
+            candidates = [
+                pytesseract.image_to_string(image, lang=language, config="--psm 6"),
+                pytesseract.image_to_string(prepared, lang=language, config="--psm 11"),
+            ]
+            # Preserve all useful OCR lines; parse_receipt_text deduplicates
+            # fields while the original text remains available to the admin.
+            pages.append("\n".join(text for text in candidates if text.strip()))
+        except Exception:
+            # Try each installed language before giving up. This keeps Cyrillic
+            # receipts working when only one of ukr/rus is installed.
+            try:
+                page_text = ""
+                for fallback_language in ("ukr", "rus", "eng"):
+                    if installed_languages and fallback_language not in installed_languages:
+                        continue
+                    try:
+                        page_text = pytesseract.image_to_string(
+                            image,
+                            lang=fallback_language,
+                            config="--psm 6",
+                        )
+                        if page_text.strip():
+                            break
+                    except Exception:
+                        continue
+                if page_text:
+                    pages.append(page_text)
+                else:
+                    raise RuntimeError("не знайдено доступну мову Tesseract")
+            except Exception as exc:
+                return {}, "", f"Tesseract не налаштований: {exc}"
+    text = "\n".join(page for page in pages if page).strip()
+    data = parse_receipt_text(text)
+    return data, text, ""
+
+
+def receipt_summary(data, error=""):
+    if error:
+        return f"⚠️ OCR: {esc(error)}"
+    if not data:
+        return "⚠️ Дані квитанції не розпізнано — перевірте файл вручну."
+    fields = [
+        ("№ квитанції", data.get("receipt_number")),
+        ("Банк", data.get("bank")),
+        ("Перевірка банку", data.get("bank_match")),
+        ("Сума", data.get("amount")),
+        ("Перевірка суми", data.get("amount_match")),
+        ("Відправник", data.get("sender_name")),
+        ("Одержувач", data.get("receiver_name")),
+        ("Дата операції", data.get("operation_datetime")),
+    ]
+    visible = "\n".join(f"• {label}: <b>{esc(value)}</b>" for label, value in fields if value)
+    return f"🧾 <b>{esc(data.get('ocr_status', 'Потрібна перевірка'))}</b>\n{visible or '• Поля не знайдені'}"
+
+
 def now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -161,6 +930,20 @@ CREATE TABLE IF NOT EXISTS orders (
     nft_id INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS receipt_archive (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    receipt_file_id TEXT NOT NULL,
+    receipt_type TEXT,
+    receipt_file_name TEXT,
+    receipt_ocr_text TEXT,
+    receipt_data_json TEXT,
+    receipt_parsed_at TEXT,
+    receipt_error TEXT,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS balance_adjustments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
@@ -190,6 +973,46 @@ CREATE TABLE IF NOT EXISTS ui_messages (
     message_id INTEGER NOT NULL,
     screen_key TEXT
 );
+
+CREATE TABLE IF NOT EXISTS raffles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_stars INTEGER NOT NULL,
+    pool_stars INTEGER NOT NULL DEFAULT 0,
+    rules TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_by INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    winner_id INTEGER,
+    prize_stars INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS raffle_entries (
+    raffle_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    joined_at TEXT NOT NULL,
+    PRIMARY KEY (raffle_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS raffle_contributions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    raffle_id INTEGER NOT NULL,
+    order_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    purchased_stars INTEGER NOT NULL,
+    contributed_stars INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (raffle_id, order_id)
+);
+
+CREATE TABLE IF NOT EXISTS raffle_consents (
+    raffle_id INTEGER NOT NULL,
+    order_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    decision TEXT NOT NULL CHECK (decision IN ('accepted','declined')),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (raffle_id, order_id)
+);
 """)
 
 def ensure_column(table: str, column: str, definition: str):
@@ -200,10 +1023,36 @@ def ensure_column(table: str, column: str, definition: str):
 
 
 ensure_column("orders", "nft_id", "INTEGER")
+ensure_column("orders", "receipt_ocr_text", "TEXT")
+ensure_column("orders", "receipt_data_json", "TEXT")
+ensure_column("orders", "receipt_parsed_at", "TEXT")
+ensure_column("orders", "receipt_error", "TEXT")
 ensure_column("nfts", "sticker_file_id", "TEXT")
 ensure_column("nfts", "sticker_type", "TEXT")
 ensure_column("nfts", "custom_emoji_id", "TEXT")
 ensure_column("ui_messages", "screen_key", "TEXT")
+
+# Preserve receipts saved by an earlier version before the archive table
+# existed. This migration is idempotent for each order/file pair.
+db.execute(
+    """INSERT INTO receipt_archive(
+           order_id,user_id,receipt_file_id,receipt_type,receipt_ocr_text,
+           receipt_data_json,receipt_parsed_at,receipt_error,created_at
+       )
+       SELECT orders.id,orders.user_id,orders.receipt_file_id,orders.receipt_type,
+              orders.receipt_ocr_text,orders.receipt_data_json,
+              orders.receipt_parsed_at,orders.receipt_error,
+              COALESCE(orders.receipt_parsed_at, orders.created_at)
+       FROM orders
+       WHERE orders.receipt_file_id IS NOT NULL
+         AND NOT EXISTS (
+             SELECT 1
+             FROM receipt_archive
+             WHERE receipt_archive.order_id=orders.id
+               AND receipt_archive.receipt_file_id=orders.receipt_file_id
+         )"""
+)
+db.commit()
 
 DEFAULTS = {
     "stars_rate": "0.73",
@@ -211,6 +1060,12 @@ DEFAULTS = {
     "min_withdraw": "50",
     "support": SUPPORT_USERNAME,
     "reviews_url": REVIEWS_URL,
+    # This is a reporting checkpoint, not a data deletion flag. Resetting
+    # statistics keeps users, orders and receipts intact.
+    "stats_reset_at": "",
+    # This is an archive checkpoint, not a data deletion flag. Resetting the
+    # receipts screen keeps the source records available in the database.
+    "receipts_reset_at": "",
 }
 for method, details in BANK_DETAILS.items():
     DEFAULTS[f"bank_{method}"] = details
@@ -239,7 +1094,7 @@ def ensure_user(user):
     if not row:
         db.execute(
             "INSERT INTO users(id,username,first_name,registered_at) VALUES(?,?,?,?)",
-            (user.id, user.username, user.first_name, datetime.now().strftime("%Y-%m-%d")),
+            (user.id, user.username, user.first_name, now()),
         )
     else:
         db.execute(
@@ -275,6 +1130,44 @@ def create_order(uid, order_type, quantity, amount, nft_id=None):
     )
     db.commit()
     return cur.lastrowid
+
+
+def active_raffle():
+    return db.execute(
+        "SELECT * FROM raffles WHERE status='active' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+
+
+def current_raffle():
+    return db.execute(
+        "SELECT * FROM raffles WHERE status IN ('active','ready') ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+
+
+def raffle_fee(stars: int) -> int:
+    """Round 3% of an integer Stars purchase to the nearest whole Star."""
+    return (max(0, int(stars)) * 3 + 50) // 100
+
+
+def record_raffle_contribution(raffle_id: int, order_id: int, user_id: int, purchased_stars: int):
+    fee = raffle_fee(purchased_stars)
+    cur = db.execute(
+        """INSERT OR IGNORE INTO raffle_contributions
+           (raffle_id,order_id,user_id,purchased_stars,contributed_stars,created_at)
+           VALUES(?,?,?,?,?,?)""",
+        (raffle_id, order_id, user_id, purchased_stars, fee, now()),
+    )
+    if cur.rowcount == 0:
+        return 0
+
+    db.execute(
+        "UPDATE raffles SET pool_stars=pool_stars+? WHERE id=? AND status='active'",
+        (fee, raffle_id),
+    )
+    raffle = db.execute("SELECT target_stars,pool_stars,status FROM raffles WHERE id=?", (raffle_id,)).fetchone()
+    if raffle and raffle["status"] == "active" and raffle["pool_stars"] >= raffle["target_stars"]:
+        db.execute("UPDATE raffles SET status='ready' WHERE id=? AND status='active'", (raffle_id,))
+    return fee
 
 
 def kb_button(text, *, emoji_id=None, style=None, callback_data=None, url=None):
@@ -320,18 +1213,18 @@ def main_menu():
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
-ASSET_DIR = Path(os.getenv("ASSET_DIR", "attached_assets"))
+ASSET_DIR = Path(__file__).resolve().parent / "assets"
 
 SCREEN_IMAGES = {
-    "welcome": "0DAC8ABF-4E80-4DAC-9765-68EBFE20BAD1_1790343358458.png",
-    "stars": "8F1E5F14-6C85-481A-89C0-CB8DDB51C6E7_1790343358459.png",
-    "ton": "CBAC6203-7823-4978-B81E-835F062AFBAE_1790343358459.png",
-    "nft": "IMG_0464_1790343358459.jpeg",
-    "sell": "IMG_0465_1790343358459.jpeg",
-    "support": "IMG_0466_1790343358459.jpeg",
-    "withdraw": "IMG_0467_1790343358459.jpeg",
-    "calculator": "IMG_0468_1790343358459.jpeg",
-    "reviews": "IMG_0469_1790343358459.jpeg",
+    "welcome": "0DAC8ABF-4E80-4DAC-9765-68EBFE20BAD1_1790276163145.png",
+    "stars": "8F1E5F14-6C85-481A-89C0-CB8DDB51C6E7_1790276163149.png",
+    "ton": "CBAC6203-7823-4978-B81E-835F062AFBAE_1790276163149.png",
+    "nft": "IMG_0464_1790276163150.jpeg",
+    "sell": "IMG_0465_1790276163150.jpeg",
+    "support": "IMG_0466_1790276163150.jpeg",
+    "withdraw": "IMG_0467_1790276163150.jpeg",
+    "calculator": "IMG_0468_1790276163150.jpeg",
+    "reviews": "IMG_0469_1790276163150.jpeg",
 }
 
 
@@ -446,14 +1339,7 @@ def payment_kb(order_id):
 
 def bank_kb(order_id):
     b = InlineKeyboardBuilder()
-    banks = [
-        ("Privat24", "private"),
-        ("Mono", "mono"),
-        ("PUMB", "pumb"),
-        ("Альянс", "alliance"),
-        ("А-Банк", "abank"),
-    ]
-    for name, code in banks:
+    for name, code, _ in BANK_OPTIONS:
         b.row(kb_button(name, emoji_id=EMOJI_POOL[3], style="danger", callback_data=f"bank:{order_id}:{code}"))
     b.row(back_inline(f"backpay:{order_id}"))
     b.row(kb_button("Скасувати", emoji_id=EMOJI_POOL[3], style="danger", callback_data=f"cancel_order:{order_id}"))
@@ -474,16 +1360,38 @@ def admin_order_kb(order_id):
     return b.as_markup()
 
 
+def raffle_consent_kb(raffle_id, order_id):
+    b = InlineKeyboardBuilder()
+    b.row(kb_button(
+        "Так, внести 3% з цього поповнення",
+        emoji_id=EMOJI_POOL[0],
+        style="success",
+        callback_data=f"raffle_consent:{raffle_id}:{order_id}:yes",
+    ))
+    b.row(kb_button(
+        "Відмовитись",
+        emoji_id=EMOJI_POOL[3],
+        style="danger",
+        callback_data=f"raffle_consent:{raffle_id}:{order_id}:no",
+    ))
+    return b.as_markup()
+
+
+def raffle_admin_kb(raffle):
+    b = InlineKeyboardBuilder()
+    if not raffle:
+        b.row(kb_button("Створити розіграш", emoji_id=EMOJI_POOL[0], style="success", callback_data="adm:raffle:create"))
+    elif raffle["status"] == "ready":
+        b.row(kb_button("Провести розіграш", emoji_id=EMOJI_POOL[0], style="success", callback_data=f"raffle:draw:{raffle['id']}"))
+    else:
+        b.row(kb_button("Оновити дані", emoji_id=EMOJI_POOL[27], style="primary", callback_data="adm:raffle"))
+    b.row(back_inline("admin:back"))
+    return b.as_markup()
+
+
 def bank_details_kb():
     b = InlineKeyboardBuilder()
-    banks = [
-        ("Privat24", "private"),
-        ("Mono", "mono"),
-        ("PUMB", "pumb"),
-        ("Альянс", "alliance"),
-        ("А-Банк", "abank"),
-    ]
-    for name, code in banks:
+    for name, code, _ in BANK_OPTIONS:
         b.row(kb_button(name, emoji_id=EMOJI_POOL[3], style="primary", callback_data=f"adm_bank:{code}"))
     b.row(back_inline("admin:back"))
     return b.as_markup()
@@ -500,18 +1408,58 @@ def admin_menu_kb():
     items = [
         ("Курс Stars", EMOJI_POOL[0], "success", "adm:stars_rate"),
         ("Курс TON", EMOJI_POOL[2], "success", "adm:ton_rate"),
+        ("Розіграш", EMOJI_POOL[16], "success", "adm:raffle"),
         ("Баланс Stars", MAIN_EMOJI["buy_stars"], "primary", "adm:balance"),
         ("NFT", MAIN_EMOJI["nft"], "primary", "adm:nft"),
         ("Реквізити карток", EMOJI_POOL[3], "success", "adm:bank_details"),
         ("Розсилка", EMOJI_POOL[16], "primary", "adm:broadcast"),
         ("Підтримка", MAIN_EMOJI["support"], "success", "adm:support"),
         ("Канал відгуків", MAIN_EMOJI["reviews"], "primary", "adm:reviews"),
-        ("Замовлення", EMOJI_POOL[16], "primary", "adm:orders"),
+        ("Підтвердження оплат", EMOJI_POOL[16], "primary", "adm:orders"),
         ("Користувачі", EMOJI_POOL[3], "primary", "adm:users"),
         ("Статистика", EMOJI_POOL[27], "primary", "adm:stats"),
+        ("Квитанції", EMOJI_POOL[5], "primary", "adm:receipts"),
     ]
     for text, eid, style, data in items:
         b.row(kb_button(text, emoji_id=eid, style=style, callback_data=data))
+    return b.as_markup()
+
+
+def stats_kb():
+    b = InlineKeyboardBuilder()
+    b.row(kb_button("Оновити", emoji_id=EMOJI_POOL[27], style="primary", callback_data="adm:stats"))
+    b.row(kb_button("Скинути статистику", emoji_id=EMOJI_POOL[3], style="danger", callback_data="adm:stats_reset"))
+    b.row(back_inline("admin:back"))
+    return b.as_markup()
+
+
+def receipts_kb():
+    b = InlineKeyboardBuilder()
+    b.row(kb_button(
+        "Вигрузити всі квитанції",
+        emoji_id=EMOJI_POOL[5],
+        style="success",
+        callback_data="adm:receipts_export",
+    ))
+    b.row(kb_button(
+        "Скинути архів квитанцій",
+        emoji_id=EMOJI_POOL[3],
+        style="danger",
+        callback_data="adm:receipts_reset",
+    ))
+    b.row(back_inline("admin:back"))
+    return b.as_markup()
+
+
+def receipts_reset_confirm_kb():
+    b = InlineKeyboardBuilder()
+    b.row(kb_button(
+        "Так, скинути архів",
+        emoji_id=EMOJI_POOL[3],
+        style="danger",
+        callback_data="adm:receipts_reset_confirm",
+    ))
+    b.row(back_inline("adm:receipts"))
     return b.as_markup()
 
 
@@ -546,14 +1494,35 @@ class Form(StatesGroup):
     reviews_setting = State()
     balance_target = State()
     balance_amount = State()
+    raffle_target = State()
+    raffle_rules = State()
 
 
-bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+# The token is supplied through Replit Secrets. Keep Bot construction lazy so
+# importing this module for checks or migrations does not fail before secrets
+# have been configured.
+bot: Bot | None = None
 dp = Dispatcher()
+_processed_start_messages: set[tuple[int, int]] = set()
+_last_start_at: dict[int, float] = {}
+START_DEDUP_SECONDS = 2.0
 
 
-async def notify_admins(text, reply_markup=None, photo=None, document=None):
-    for aid in ADMIN_IDS:
+@dp.errors()
+async def ignore_forbidden_delivery(event: ErrorEvent):
+    if isinstance(event.exception, TelegramForbiddenError):
+        return True
+
+
+async def notify_admins(
+    text,
+    reply_markup=None,
+    photo=None,
+    document=None,
+    recipient_ids=None,
+):
+    delivered = 0
+    for aid in ADMIN_IDS if recipient_ids is None else recipient_ids:
         try:
             if photo:
                 await bot.send_photo(aid, photo=photo, caption=text, reply_markup=reply_markup)
@@ -561,8 +1530,21 @@ async def notify_admins(text, reply_markup=None, photo=None, document=None):
                 await bot.send_document(aid, document=document, caption=text, reply_markup=reply_markup)
             else:
                 await bot.send_message(aid, text, reply_markup=reply_markup)
-        except Exception:
-            pass
+            delivered += 1
+            print(f"Admin notification delivered for {aid}.", flush=True)
+        except Exception as exc:
+            # A file_id can occasionally fail while a plain message still
+            # works. Never lose the payment request silently.
+            print(f"Admin notification failed for {aid}: {exc}")
+            if photo or document:
+                try:
+                    await bot.send_message(aid, text, reply_markup=reply_markup)
+                    delivered += 1
+                except Exception as fallback_exc:
+                    print(f"Admin text notification failed for {aid}: {fallback_exc}")
+    if not ADMIN_IDS:
+        print("Admin notification skipped: ADMIN_IDS is empty.")
+    return delivered
 
 
 async def configure_bot_commands():
@@ -574,30 +1556,29 @@ async def configure_bot_commands():
         await bot.set_my_commands(
             [
                 BotCommand(command="start", description="Відкрити головне меню"),
-                BotCommand(command="id", description="Показати Telegram ID"),
                 BotCommand(command="admin", description="Відкрити адмін-панель"),
             ],
             scope=BotCommandScopeChat(chat_id=aid),
         )
 
 
-async def start_health_server():
-    async def health(_request):
-        return web.Response(text="Razor Stars Bot is running")
-
-    app = web.Application()
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.getenv("PORT", "8765"))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    return runner
-
-
 @dp.message(CommandStart())
 async def start(message: Message, state: FSMContext):
+    now = asyncio.get_running_loop().time()
+    start_key = (message.chat.id, message.message_id)
+    last_start = _last_start_at.get(message.chat.id)
+    if start_key in _processed_start_messages or (
+        last_start is not None and now - last_start < START_DEDUP_SECONDS
+    ):
+        print(
+            f"Ignored duplicate /start from chat {message.chat.id}.",
+            flush=True,
+        )
+        return
+    _processed_start_messages.add(start_key)
+    _last_start_at[message.chat.id] = now
+    if len(_processed_start_messages) > 5000:
+        _processed_start_messages.clear()
     ensure_user(message.from_user)
     await state.clear()
     await replace_screen(
@@ -695,7 +1676,7 @@ async def stars_select(call: CallbackQuery, state: FSMContext):
 @dp.message(Form.custom_stars)
 async def custom_stars(message: Message, state: FSMContext):
     try:
-        stars = int(message.text.strip())
+        stars = int((message.text or "").strip())
         if stars < 50:
             raise ValueError
     except (ValueError, TypeError):
@@ -764,6 +1745,19 @@ async def choose_bank(call: CallbackQuery):
 async def back_payment(call: CallbackQuery):
     await call.answer()
     oid = int(call.data.split(":")[1])
+    order = db.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+    if (
+        not order
+        or order["user_id"] != call.from_user.id
+        or order["status"] not in ("waiting_payment", "waiting_review")
+    ):
+        await replace_screen(
+            call.from_user.id,
+            "❌ Замовлення більше недоступне.",
+            image="stars",
+            reply_markup=main_menu(),
+        )
+        return
     await replace_screen(
         call.from_user.id,
         "💳 <b>Оберіть спосіб оплати</b>",
@@ -777,7 +1771,18 @@ async def receipt_start(call: CallbackQuery, state: FSMContext):
     await call.answer()
     oid = int(call.data.split(":")[1])
     order = db.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
-    if not order or order["user_id"] != call.from_user.id:
+    if (
+        not order
+        or order["user_id"] != call.from_user.id
+        or order["status"] not in ("waiting_payment", "waiting_review")
+        or not order["payment_method"]
+    ):
+        await replace_screen(
+            call.from_user.id,
+            "❌ Спочатку оберіть банк для цього замовлення.",
+            image="stars",
+            reply_markup=main_menu(),
+        )
         return
     await state.update_data(receipt_order=oid)
     await state.set_state(Form.receipt)
@@ -789,19 +1794,98 @@ async def receipt_start(call: CallbackQuery, state: FSMContext):
     )
 
 
-async def save_receipt(message: Message, state: FSMContext, file_id: str, file_type: str):
+async def save_receipt(
+    message: Message,
+    state: FSMContext,
+    file_id: str,
+    file_type: str,
+    file_name: str = "",
+):
     data = await state.get_data()
     oid = data.get("receipt_order")
     if not oid:
         await state.clear()
         return
     order = db.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
-    if not order or order["user_id"] != message.from_user.id:
+    if (
+        not order
+        or order["user_id"] != message.from_user.id
+        or order["status"] not in ("waiting_payment", "waiting_review")
+    ):
         await state.clear()
         return
+
+    receipt_data = {}
+    ocr_text = ""
+    receipt_error = ""
+    suffix = Path(file_name or "").suffix.lower()
+    if not suffix:
+        suffix = ".jpg" if file_type == "photo" else ".bin"
+    temp_path = None
+    try:
+        telegram_file = await bot.get_file(file_id)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+            temp_path = Path(temp_file.name)
+        await bot.download_file(telegram_file.file_path, destination=temp_path)
+        receipt_data, ocr_text, receipt_error = await asyncio.to_thread(
+            ocr_receipt_file,
+            temp_path,
+        )
+    except Exception as exc:
+        receipt_error = f"Не вдалося завантажити квитанцію для OCR: {exc}"
+    finally:
+        if temp_path:
+            temp_path.unlink(missing_ok=True)
+
+    if not receipt_data and receipt_error:
+        receipt_data = {"ocr_status": "Потрібна перевірка"}
+    if receipt_data:
+        expected_method = order["payment_method"] or ""
+        receipt_data["expected_bank"] = BANK_DISPLAY_NAMES.get(expected_method, "")
+        receipt_data["bank_match"] = _bank_method_match(
+            expected_method,
+            receipt_data.get("bank", ""),
+        )
+        receipt_data["order_amount"] = f"{float(order['amount']):.2f}"
+        receipt_data["amount_match"] = _amount_match(
+            receipt_data.get("amount", ""),
+            order["amount"],
+        )
+    parsed_at = now()
     db.execute(
-        "UPDATE orders SET receipt_file_id=?,receipt_type=?,status='waiting_review' WHERE id=?",
-        (file_id, file_type, oid),
+        """UPDATE orders
+           SET receipt_file_id=?,receipt_type=?,receipt_ocr_text=?,
+               receipt_data_json=?,receipt_parsed_at=?,receipt_error=?,
+               status='waiting_review'
+           WHERE id=?""",
+        (
+            file_id,
+            file_type,
+            ocr_text,
+            json.dumps(receipt_data, ensure_ascii=False),
+            parsed_at,
+            receipt_error,
+            oid,
+        ),
+    )
+    db.execute(
+        """INSERT INTO receipt_archive(
+               order_id,user_id,receipt_file_id,receipt_type,receipt_file_name,
+               receipt_ocr_text,receipt_data_json,receipt_parsed_at,
+               receipt_error,created_at
+           ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+        (
+            oid,
+            order["user_id"],
+            file_id,
+            file_type,
+            file_name,
+            ocr_text,
+            json.dumps(receipt_data, ensure_ascii=False),
+            parsed_at,
+            receipt_error,
+            parsed_at,
+        ),
     )
     db.commit()
     await state.clear()
@@ -820,12 +1904,58 @@ async def save_receipt(message: Message, state: FSMContext, file_id: str, file_t
         f"📦 {esc(order['order_type'])}: <b>{esc(order['quantity'])}</b>\n"
         f"💰 <b>{order['amount']:.2f} грн</b>\n"
         f"💳 {esc(order['payment_method'] or '—')}\n"
-        f"🕒 {order['created_at']}"
+        f"🕒 {order['created_at']}\n\n"
+        f"{receipt_summary(receipt_data, receipt_error)}"
     )
+    sender_is_admin = message.from_user.id in ADMIN_IDS
+    other_admin_ids = ADMIN_IDS - {message.from_user.id} if sender_is_admin else None
     if file_type == "photo":
-        await notify_admins(text, admin_order_kb(oid), photo=file_id)
+        delivered = await notify_admins(
+            text,
+            admin_order_kb(oid),
+            photo=file_id,
+            recipient_ids=other_admin_ids,
+        )
     else:
-        await notify_admins(text, admin_order_kb(oid), document=file_id)
+        delivered = await notify_admins(
+            text,
+            admin_order_kb(oid),
+            document=file_id,
+            recipient_ids=other_admin_ids,
+        )
+    if sender_is_admin:
+        try:
+            if file_type == "photo":
+                await bot.send_photo(
+                    message.from_user.id,
+                    photo=file_id,
+                    caption=text,
+                    reply_markup=admin_order_kb(oid),
+                )
+            else:
+                await bot.send_document(
+                    message.from_user.id,
+                    document=file_id,
+                    caption=text,
+                    reply_markup=admin_order_kb(oid),
+                )
+            delivered += 1
+            print(
+                f"Admin notification delivered directly to sender {message.from_user.id}.",
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                f"Direct admin notification failed for {message.from_user.id}: {exc}",
+                flush=True,
+            )
+    if not delivered:
+        await message.answer(
+            "⚠️ Квитанцію збережено, але повідомлення адміністратору не доставлено.\n"
+            "Перевірте, що ваш Telegram ID доданий у ADMIN_IDS, а адмін відкрив боту "
+            "та натиснув /start.",
+            reply_markup=main_menu(),
+        )
 
 
 @dp.message(Form.receipt, F.photo)
@@ -835,7 +1965,13 @@ async def receipt_photo(message: Message, state: FSMContext):
 
 @dp.message(Form.receipt, F.document)
 async def receipt_document(message: Message, state: FSMContext):
-    await save_receipt(message, state, message.document.file_id, "document")
+    await save_receipt(
+        message,
+        state,
+        message.document.file_id,
+        "document",
+        message.document.file_name or "",
+    )
 
 
 @dp.message(Form.receipt)
@@ -853,7 +1989,11 @@ async def cancel_order(call: CallbackQuery):
     await call.answer()
     oid = int(call.data.split(":")[1])
     order = db.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
-    if not order or order["user_id"] != call.from_user.id:
+    if (
+        not order
+        or order["user_id"] != call.from_user.id
+        or order["status"] not in ("waiting_payment", "waiting_review")
+    ):
         return
     db.execute("UPDATE orders SET status='cancelled' WHERE id=?", (oid,))
     db.commit()
@@ -1242,6 +2382,408 @@ async def admin_back(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text("⚙️ <b>Адмін-панель</b>", reply_markup=admin_menu_kb())
 
 
+@dp.callback_query(F.data == "adm:raffle")
+async def adm_raffle(call: CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        await call.answer("Немає доступу.", show_alert=True)
+        return
+    await call.answer()
+    raffle = current_raffle()
+    if not raffle:
+        text = (
+            "🎁 <b>Розіграші</b>\n\n"
+            "Активного розіграшу зараз немає.\n"
+            "Створіть його, задайте ціль у Stars і напишіть умови."
+        )
+    else:
+        entries = db.execute(
+            "SELECT COUNT(*) AS total FROM raffle_entries WHERE raffle_id=?",
+            (raffle["id"],),
+        ).fetchone()["total"]
+        status_text = "Ціль досягнута — можна проводити розіграш." if raffle["status"] == "ready" else "Набираються внески."
+        text = (
+            f"🎁 <b>Розіграш #{raffle['id']}</b>\n\n"
+            f"📊 Статус: {status_text}\n"
+            f"⭐ Пул: <b>{raffle['pool_stars']} / {raffle['target_stars']} Stars</b>\n"
+            f"👥 Учасників: <b>{entries}</b>\n\n"
+            f"📜 <b>Умови:</b>\n{esc(raffle['rules'])}"
+        )
+    await call.message.edit_text(text, reply_markup=raffle_admin_kb(raffle))
+
+
+@dp.callback_query(F.data == "adm:raffle:create")
+async def raffle_create_start(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id not in ADMIN_IDS:
+        await call.answer("Немає доступу.", show_alert=True)
+        return
+    if current_raffle():
+        await call.answer("Спочатку завершіть поточний розіграш.", show_alert=True)
+        return
+    await call.answer()
+    await state.set_state(Form.raffle_target)
+    await call.message.answer(
+        "🎁 <b>Новий розіграш</b>\n\n"
+        "Введіть ціль пулу в цілих Stars. Коли внески досягнуть цієї суми, "
+        "у меню з'явиться кнопка для випадкового вибору переможця.",
+        reply_markup=cancel_kb(),
+    )
+
+
+@dp.message(Form.raffle_target)
+async def raffle_target_entered(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        target = int((message.text or "").strip())
+        if target < 1 or target > 100_000_000:
+            raise ValueError
+    except (ValueError, TypeError):
+        await message.answer("❌ Введіть ціле число Stars від 1 до 100 000 000.")
+        return
+    await state.update_data(raffle_target=target)
+    await state.set_state(Form.raffle_rules)
+    await message.answer(
+        "📜 Надішліть умови участі одним повідомленням.\n"
+        "Надішліть <code>-</code>, щоб використати стандартні умови.",
+        reply_markup=cancel_kb(),
+    )
+
+
+@dp.message(Form.raffle_rules)
+async def raffle_rules_entered(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    rules = (message.text or "").strip()
+    if rules == "-":
+        rules = (
+            "Участь добровільна. Один запис на користувача. "
+            "Після кожного підтвердженого поповнення Stars бот окремо запитує згоду. "
+            "Лише після натискання кнопки згоди 3% саме з цього поповнення "
+            "(округлення до цілої Stars) надходять у спільний пул. "
+            "Відмова не списує Stars. "
+            "Після досягнення цілі адмін проводить випадковий розіграш. "
+            "Переможець отримує весь пул Stars на баланс."
+        )
+    if not rules or len(rules) > 3000:
+        await message.answer("❌ Умови мають містити до 3000 символів.")
+        return
+    data = await state.get_data()
+    target = int(data.get("raffle_target", 0))
+    if current_raffle():
+        await state.clear()
+        await message.answer(
+            "❌ Інший розіграш уже активний. Спочатку завершіть його.",
+            reply_markup=admin_menu_kb(),
+        )
+        return
+    cur = db.execute(
+        """INSERT INTO raffles(target_stars,pool_stars,rules,status,created_by,created_at)
+           VALUES(?,0,?,'active',?,?)""",
+        (target, rules, message.from_user.id, now()),
+    )
+    db.commit()
+    raffle_id = cur.lastrowid
+    await state.clear()
+    await message.answer(
+        f"✅ <b>Розіграш #{raffle_id} створено</b>\n"
+        f"🎯 Ціль: <b>{target} Stars</b>\n"
+        "Запрошення надсилатиметься після підтвердження поповнення Stars.",
+        reply_markup=raffle_admin_kb(current_raffle()),
+    )
+
+
+def raffle_consent_text(raffle, order, user_id):
+    already_entered = db.execute(
+        "SELECT 1 FROM raffle_entries WHERE raffle_id=? AND user_id=?",
+        (raffle["id"], user_id),
+    ).fetchone()
+    contribution = raffle_fee(int(order["quantity"]))
+    if already_entered:
+        intro = (
+            "Ви вже маєте один квиток у цьому розіграші. "
+            "Вирішіть, чи внести 3% саме з цього поповнення."
+        )
+        refusal = "Якщо відмовитесь, ваш квиток залишиться, але з цього поповнення нічого не спишеться."
+    else:
+        intro = "Згода оформить вам один квиток у цьому розіграші."
+        refusal = "Якщо відмовитесь, ви не будете додані до учасників і списання не буде."
+    return (
+        f"🎁 <b>Внесок у розіграш #{raffle['id']} з поповнення #{order['id']}?</b>\n\n"
+        f"{esc(intro)}\n"
+        f"⭐ Згода спише <b>{contribution} Stars</b> — 3% саме з поповнення "
+        f"на {int(order['quantity'])} Stars, округлено до цілої Stars.\n"
+        f"🔁 Для кожного наступного поповнення бот запитає дозвіл окремо.\n"
+        f"↩️ {esc(refusal)}\n\n"
+        f"🎯 Ціль пулу: <b>{raffle['target_stars']} Stars</b>\n"
+        f"📜 <b>Умови:</b>\n{esc(raffle['rules'])}"
+    )
+
+
+@dp.callback_query(F.data.startswith("raffle_consent:"))
+async def raffle_consent(call: CallbackQuery):
+    try:
+        _, raffle_s, order_s, decision = call.data.split(":")
+        raffle_id, order_id = int(raffle_s), int(order_s)
+    except (AttributeError, TypeError, ValueError):
+        await call.answer("Не вдалося перевірити відповідь.", show_alert=True)
+        return
+
+    if decision not in {"yes", "no"} or not call.from_user:
+        await call.answer("Некоректна відповідь.", show_alert=True)
+        return
+
+    contribution = 0
+    already_contributed = False
+    already_entered = False
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        raffle = db.execute("SELECT * FROM raffles WHERE id=?", (raffle_id,)).fetchone()
+        order = db.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+        if (
+            not raffle
+            or raffle["status"] not in {"active", "ready", "completed"}
+            or not order
+            or order["user_id"] != call.from_user.id
+            or order["order_type"] != "buy_stars"
+            or order["status"] != "completed"
+        ):
+            db.rollback()
+            await call.answer("Не вдалося перевірити це поповнення або розіграш.", show_alert=True)
+            return
+
+        previous_response = db.execute(
+            "SELECT decision FROM raffle_consents WHERE raffle_id=? AND order_id=?",
+            (raffle_id, order_id),
+        ).fetchone()
+        if previous_response:
+            db.rollback()
+            await call.answer("Відповідь для цього поповнення вже збережена.", show_alert=True)
+            return
+
+        if decision == "no":
+            db.execute(
+                """INSERT INTO raffle_consents(raffle_id,order_id,user_id,decision,created_at)
+                   VALUES(?,?,?,'declined',?)""",
+                (raffle_id, order_id, call.from_user.id, now()),
+            )
+            db.commit()
+        else:
+            if raffle["status"] != "active":
+                db.rollback()
+                await call.answer("Цей розіграш уже не приймає внески.", show_alert=True)
+                return
+
+            prior_contribution = db.execute(
+                "SELECT contributed_stars FROM raffle_contributions WHERE raffle_id=? AND order_id=?",
+                (raffle_id, order_id),
+            ).fetchone()
+            already_contributed = prior_contribution is not None
+            contribution = int(prior_contribution["contributed_stars"]) if prior_contribution else raffle_fee(
+                int(order["quantity"])
+            )
+            entered = db.execute(
+                "SELECT 1 FROM raffle_entries WHERE raffle_id=? AND user_id=?",
+                (raffle_id, call.from_user.id),
+            ).fetchone()
+            already_entered = entered is not None
+            if not entered:
+                db.execute(
+                    "INSERT INTO raffle_entries(raffle_id,user_id,joined_at) VALUES(?,?,?)",
+                    (raffle_id, call.from_user.id, now()),
+                )
+
+            if not already_contributed:
+                cursor = db.execute(
+                    "UPDATE users SET balance_stars=balance_stars-? WHERE id=? AND balance_stars>=?",
+                    (contribution, call.from_user.id, contribution),
+                )
+                if cursor.rowcount != 1:
+                    db.rollback()
+                    await call.answer(
+                        "На балансі недостатньо Stars. Нічого не списано.",
+                        show_alert=True,
+                    )
+                    return
+                recorded = record_raffle_contribution(
+                    raffle_id,
+                    order_id,
+                    call.from_user.id,
+                    int(order["quantity"]),
+                )
+                if recorded != contribution:
+                    raise RuntimeError("Raffle contribution could not be recorded exactly once")
+
+            db.execute(
+                """INSERT INTO raffle_consents(raffle_id,order_id,user_id,decision,created_at)
+                   VALUES(?,?,?,'accepted',?)""",
+                (raffle_id, order_id, call.from_user.id, now()),
+            )
+            db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    if decision == "no":
+        await call.answer("Відмову збережено. 0 Stars списано.")
+        await call.message.answer(
+            f"✅ Ви відмовились від внеску з поповнення #{order_id}. "
+            "Списання не було."
+        )
+        return
+
+    updated_user = user_row(call.from_user.id)
+    updated_raffle = db.execute("SELECT * FROM raffles WHERE id=?", (raffle_id,)).fetchone()
+    if already_contributed:
+        contribution_line = (
+            f"Ці <b>{contribution} Stars</b> з цього поповнення вже були враховані раніше; "
+            "повторного списання не було."
+        )
+    else:
+        contribution_line = (
+            f"До пулу додано <b>{contribution} Stars</b> з цього поповнення."
+        )
+    entry_line = "Ваш квиток збережено." if already_entered else "Ви отримали один квиток."
+    await call.answer("Згоду збережено для цього поповнення.")
+    await call.message.answer(
+        f"🎟 <b>Згоду на внесок з поповнення #{order_id} збережено.</b>\n\n"
+        f"{entry_line}\n"
+        f"{contribution_line}\n"
+        f"💳 Баланс: <b>{updated_user['balance_stars']} Stars</b>\n"
+        f"🎁 Пул: <b>{updated_raffle['pool_stars']} / "
+        f"{updated_raffle['target_stars']} Stars</b>\n\n"
+        "Наступного разу бот знову окремо запитає ваш дозвіл."
+    )
+
+
+@dp.callback_query(F.data.startswith("raffle_join:"))
+async def refresh_legacy_raffle_invite(call: CallbackQuery):
+    try:
+        _, raffle_s, order_s = call.data.split(":")
+        raffle_id, order_id = int(raffle_s), int(order_s)
+    except (AttributeError, TypeError, ValueError):
+        await call.answer("Це старе запрошення більше не діє.", show_alert=True)
+        return
+
+    raffle = db.execute("SELECT * FROM raffles WHERE id=?", (raffle_id,)).fetchone()
+    order = db.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+    if (
+        not call.from_user
+        or not raffle
+        or raffle["status"] != "active"
+        or not order
+        or order["user_id"] != call.from_user.id
+        or order["order_type"] != "buy_stars"
+        or order["status"] != "completed"
+    ):
+        await call.answer("Це запрошення більше неактивне.", show_alert=True)
+        return
+
+    previous_contribution = db.execute(
+        "SELECT contributed_stars FROM raffle_contributions WHERE raffle_id=? AND order_id=?",
+        (raffle_id, order_id),
+    ).fetchone()
+    if previous_contribution:
+        await call.answer(
+            "Цей внесок уже врахований. Повторного списання не буде.",
+            show_alert=True,
+        )
+        try:
+            await call.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    await call.answer(
+        "Умови оновлено: тепер кожне поповнення потребує окремої згоди.",
+        show_alert=True,
+    )
+    await call.message.edit_text(
+        raffle_consent_text(raffle, order, call.from_user.id),
+        reply_markup=raffle_consent_kb(raffle_id, order_id),
+    )
+
+
+@dp.callback_query(F.data.startswith("raffle:draw:"))
+async def raffle_draw(call: CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        await call.answer("Немає доступу.", show_alert=True)
+        return
+    raffle_id = int(call.data.split(":")[2])
+    await call.answer()
+
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        raffle = db.execute("SELECT * FROM raffles WHERE id=?", (raffle_id,)).fetchone()
+        if not raffle or raffle["status"] != "ready" or raffle["pool_stars"] < raffle["target_stars"]:
+            db.rollback()
+            await call.message.answer("❌ Розіграш ще не досяг цілі або вже оброблений.")
+            return
+        participants = db.execute(
+            "SELECT user_id FROM raffle_entries WHERE raffle_id=? ORDER BY joined_at,user_id",
+            (raffle_id,),
+        ).fetchall()
+        if not participants:
+            db.rollback()
+            await call.message.answer("❌ У розіграші ще немає учасників.")
+            return
+
+        participant_ids = [int(row["user_id"]) for row in participants]
+        winner_id = secrets.choice(participant_ids)
+        prize_stars = int(raffle["pool_stars"])
+        db.execute(
+            "UPDATE users SET balance_stars=balance_stars+? WHERE id=?",
+            (prize_stars, winner_id),
+        )
+        db.execute(
+            """UPDATE raffles SET status='completed',winner_id=?,prize_stars=?,completed_at=?
+               WHERE id=? AND status='ready'""",
+            (winner_id, prize_stars, now(), raffle_id),
+        )
+        winner = user_row(winner_id)
+        winner_balance = int(winner["balance_stars"])
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    winner_label = f"@{winner['username']}" if winner["username"] else f"ID {winner_id}"
+    await call.message.edit_text(
+        f"🏆 <b>Розіграш #{raffle_id} завершено!</b>\n\n"
+        f"Переможець: <b>{esc(winner_label)}</b>\n"
+        f"Приз зараховано: <b>{prize_stars} Stars</b>\n"
+        f"Учасників: <b>{len(participant_ids)}</b>",
+        reply_markup=admin_menu_kb(),
+    )
+    try:
+        await bot.send_message(
+            winner_id,
+            f"🎉 <b>Вітаємо! Ви перемогли в розіграші #{raffle_id}!</b>\n\n"
+            f"⭐ На ваш баланс зараховано <b>{prize_stars} Stars</b>.\n"
+            f"Поточний баланс: <b>{winner_balance} Stars</b>.",
+            reply_markup=main_menu(),
+        )
+    except Exception:
+        pass
+
+    for participant_id in participant_ids:
+        if participant_id == winner_id:
+            continue
+        try:
+            await bot.send_message(
+                participant_id,
+                f"🏁 Розіграш #{raffle_id} завершено.\n"
+                f"Переможець: <b>{esc(winner_label)}</b>.\n"
+                f"Приз <b>{prize_stars} Stars</b> зараховано на його баланс.",
+            )
+        except Exception:
+            pass
+
+
 @dp.callback_query(F.data == "adm:stars_rate")
 async def adm_stars_rate(call: CallbackQuery, state: FSMContext):
     if call.from_user.id not in ADMIN_IDS:
@@ -1321,8 +2863,8 @@ async def adm_support(call: CallbackQuery, state: FSMContext):
 async def set_support(message: Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
         return
-    value = message.text.strip()
-    if not value.startswith("@"):
+    value = (message.text or "").strip()
+    if not re.fullmatch(r"@[A-Za-z0-9_]{5,32}", value):
         await message.answer("❌ Вкажіть username у форматі @username.")
         return
     set_setting("support", value)
@@ -1379,13 +2921,7 @@ async def adm_bank_choose(call: CallbackQuery, state: FSMContext):
         return
     await call.answer()
     method = call.data.split(":", 1)[1]
-    bank_names = {
-        "private": "Privat24",
-        "mono": "Mono",
-        "pumb": "PUMB",
-        "alliance": "Альянс",
-        "abank": "А-Банк",
-    }
+    bank_names = {code: name for name, code, _ in BANK_OPTIONS}
     if method not in bank_names:
         await call.message.answer("❌ Банк не знайдено.")
         return
@@ -1627,31 +3163,319 @@ async def adm_users(call: CallbackQuery):
     )
 
 
+RECEIPT_EXPORT_HEADERS = [
+    "№",
+    "№ замовлення",
+    "Дата замовлення",
+    "ID користувача",
+    "Username",
+    "Тип замовлення",
+    "Кількість",
+    "Сума замовлення, грн",
+    "Спосіб оплати",
+    "Статус замовлення",
+    "Статус OCR",
+    "№ квитанції",
+    "Банк",
+    "Очікуваний банк",
+    "Перевірка банку",
+    "ID транзакції",
+    "ID операції",
+    "RRN",
+    "Статус платежу",
+    "Дата/час операції",
+    "Валюта",
+    "Відправник",
+    "Банк відправника",
+    "Код банку відправника",
+    "Рахунок відправника",
+    "Картка відправника",
+    "Платіжна система відправника",
+    "Платіжний інструмент відправника",
+    "Одержувач",
+    "Банк одержувача",
+    "Код банку одержувача",
+    "Рахунок одержувача",
+    "Картка одержувача",
+    "Платіжна система одержувача",
+    "Платіжний інструмент одержувача",
+    "Сума з квитанції, грн",
+    "Перевірка суми",
+    "Комісія, грн",
+    "Сума з комісією, грн",
+    "Код авторизації",
+    "Призначення платежу",
+    "Коментар",
+    "Торговець",
+    "Ідентифікатор пристрою",
+    "Тип файлу квитанції",
+    "Ім'я файлу квитанції",
+    "ID файлу квитанції",
+    "Дата розбору OCR",
+    "Помилка OCR",
+    "Повний OCR текст",
+]
+
+
+def export_receipts_csv():
+    export_dir = PROJECT_DIR / "exports"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    export_path = export_dir / f"receipts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    reset_at = setting("receipts_reset_at")
+    receipt_filter = ""
+    receipt_params = ()
+    if reset_at:
+        receipt_filter = " AND archive.created_at >= ?"
+        receipt_params = (reset_at,)
+    rows = db.execute(
+        f"""SELECT orders.*, users.username,
+                   archive.receipt_file_id AS archive_file_id,
+                   archive.receipt_type AS archive_receipt_type,
+                   archive.receipt_file_name AS archive_file_name,
+                   archive.receipt_ocr_text AS archive_ocr_text,
+                   archive.receipt_data_json AS archive_data_json,
+                   archive.receipt_error AS archive_error,
+                   archive.receipt_parsed_at AS archive_receipt_parsed_at,
+                   archive.created_at AS archive_created_at
+            FROM receipt_archive AS archive
+            JOIN orders ON orders.id=archive.order_id
+            LEFT JOIN users ON users.id=archive.user_id
+            WHERE 1=1{receipt_filter}
+            ORDER BY archive.id ASC""",
+        receipt_params,
+    ).fetchall()
+    with export_path.open("w", encoding="utf-8-sig", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=RECEIPT_EXPORT_HEADERS)
+        writer.writeheader()
+        for row_number, order in enumerate(rows, start=1):
+            try:
+                receipt = json.loads(order["archive_data_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                receipt = {}
+            writer.writerow({
+                "№": row_number,
+                "№ замовлення": order["id"],
+                "Дата замовлення": order["archive_created_at"] or order["created_at"],
+                "ID користувача": order["user_id"],
+                "Username": f"@{order['username']}" if order["username"] else "",
+                "Тип замовлення": order["order_type"],
+                "Кількість": order["quantity"],
+                "Сума замовлення, грн": f"{order['amount']:.2f}",
+                "Спосіб оплати": order["payment_method"] or "",
+                "Статус замовлення": order["status"],
+                "Статус OCR": receipt.get("ocr_status", "Потрібна перевірка"),
+                "№ квитанції": receipt.get("receipt_number", ""),
+                "Банк": receipt.get("bank", ""),
+                "Очікуваний банк": receipt.get("expected_bank", ""),
+                "Перевірка банку": receipt.get("bank_match", ""),
+                "ID транзакції": receipt.get("transaction_id", ""),
+                "ID операції": receipt.get("operation_id", ""),
+                "RRN": receipt.get("rrn", ""),
+                "Статус платежу": receipt.get("status", ""),
+                "Дата/час операції": receipt.get("operation_datetime", ""),
+                "Валюта": receipt.get("currency", ""),
+                "Відправник": receipt.get("sender_name", ""),
+                "Банк відправника": receipt.get("sender_bank", ""),
+                "Код банку відправника": receipt.get("sender_bank_code", ""),
+                "Рахунок відправника": receipt.get("sender_account", ""),
+                "Картка відправника": receipt.get("sender_card", ""),
+                "Платіжна система відправника": receipt.get("sender_payment_system", ""),
+                "Платіжний інструмент відправника": receipt.get("sender_instrument", ""),
+                "Одержувач": receipt.get("receiver_name", ""),
+                "Банк одержувача": receipt.get("receiver_bank", ""),
+                "Код банку одержувача": receipt.get("receiver_bank_code", ""),
+                "Рахунок одержувача": receipt.get("receiver_account", ""),
+                "Картка одержувача": receipt.get("receiver_card", ""),
+                "Платіжна система одержувача": receipt.get("receiver_payment_system", ""),
+                "Платіжний інструмент одержувача": receipt.get("receiver_instrument", ""),
+                "Сума з квитанції, грн": receipt.get("amount", ""),
+                "Перевірка суми": receipt.get("amount_match", ""),
+                "Комісія, грн": receipt.get("fee", ""),
+                "Сума з комісією, грн": receipt.get("total_amount", ""),
+                "Код авторизації": receipt.get("authorization_code", ""),
+                "Призначення платежу": receipt.get("payment_purpose", ""),
+                "Коментар": receipt.get("comment", ""),
+                "Торговець": receipt.get("merchant", ""),
+                "Ідентифікатор пристрою": receipt.get("device_id", ""),
+                "Тип файлу квитанції": order["archive_receipt_type"] or "",
+                "Ім'я файлу квитанції": order["archive_file_name"] or "",
+                "ID файлу квитанції": order["archive_file_id"] or "",
+                "Дата розбору OCR": order["archive_receipt_parsed_at"] or "",
+                "Помилка OCR": order["archive_error"] or "",
+                "Повний OCR текст": order["archive_ocr_text"] or "",
+            })
+    return export_path, len(rows)
+
+
+@dp.callback_query(F.data == "adm:receipts")
+async def adm_receipts(call: CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+    await call.answer()
+    reset_at = setting("receipts_reset_at")
+    receipt_filter = ""
+    receipt_params = ()
+    if reset_at:
+        receipt_filter = " AND created_at >= ?"
+        receipt_params = (reset_at,)
+    receipt_count = db.execute(
+        f"SELECT COUNT(*) AS c FROM receipt_archive "
+        f"WHERE 1=1{receipt_filter}",
+        receipt_params,
+    ).fetchone()["c"]
+    total_receipt_count = db.execute(
+        "SELECT COUNT(*) AS c FROM receipt_archive"
+    ).fetchone()["c"]
+    period = f"після {esc(reset_at)}" if reset_at else "за весь час"
+    await call.message.answer(
+        f"🧾 <b>Квитанції</b>\n\n"
+        f"У поточному архіві: <b>{receipt_count}</b>\n"
+        f"Період: <b>{period}</b>\n"
+        f"У базі збережено всього: <b>{total_receipt_count}</b>\n\n"
+        "Кнопка вигрузки сформує CSV-таблицю з усіма квитанціями "
+        "поточного архіву та всіма доступними полями OCR.",
+        reply_markup=receipts_kb(),
+    )
+
+
+@dp.callback_query(F.data == "adm:receipts_export")
+async def adm_receipts_export(call: CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+    await call.answer("Формую таблицю квитанцій…")
+    export_path, exported_count = export_receipts_csv()
+    if not exported_count:
+        await call.message.answer(
+            "🧾 Поточний архів квитанцій порожній.",
+            reply_markup=receipts_kb(),
+        )
+        return
+    await bot.send_document(
+        call.message.chat.id,
+        FSInputFile(str(export_path)),
+        caption=f"📄 Таблиця квитанцій: {exported_count} записів.",
+    )
+
+
+@dp.callback_query(F.data == "adm:receipts_reset")
+async def adm_receipts_reset(call: CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+    await call.answer()
+    await call.message.answer(
+        "⚠️ <b>Скинути поточний архів квитанцій?</b>\n\n"
+        "Старі записи не будуть видалені з бази, але зникнуть із поточного "
+        "списку та наступної вигрузки. Нові квитанції почнуть новий архів.",
+        reply_markup=receipts_reset_confirm_kb(),
+    )
+
+
+@dp.callback_query(F.data == "adm:receipts_reset_confirm")
+async def adm_receipts_reset_confirm(call: CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+    set_setting("receipts_reset_at", now())
+    await call.answer("Архів квитанцій скинуто")
+    await call.message.answer(
+        "✅ Поточний архів квитанцій скинуто. Старі записи залишилися в базі.",
+        reply_markup=receipts_kb(),
+    )
+
+
 @dp.callback_query(F.data == "adm:stats")
 async def adm_stats(call: CallbackQuery):
     if call.from_user.id not in ADMIN_IDS:
         return
     await call.answer()
-    users = db.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
-    orders = db.execute("SELECT COUNT(*) c FROM orders").fetchone()["c"]
-    done = db.execute("SELECT COUNT(*) c FROM orders WHERE status='completed'").fetchone()["c"]
-    money = db.execute("SELECT COALESCE(SUM(amount),0) s FROM orders WHERE status='completed'").fetchone()["s"]
+    await render_admin_stats(call.message)
+
+
+async def render_admin_stats(message: Message):
+    reset_at = setting("stats_reset_at")
+    user_where = "WHERE registered_at >= ?" if reset_at else ""
+    order_where = "WHERE created_at >= ?" if reset_at else ""
+    user_params = (reset_at,) if reset_at else ()
+    order_params = (reset_at,) if reset_at else ()
+    users = db.execute(
+        f"SELECT COUNT(*) c FROM users {user_where}", user_params
+    ).fetchone()["c"]
+    orders = db.execute(
+        f"SELECT COUNT(*) c FROM orders {order_where}", order_params
+    ).fetchone()["c"]
+    done = db.execute(
+        f"SELECT COUNT(*) c FROM orders {order_where}"
+        f"{' AND' if order_where else ' WHERE'} status='completed'",
+        order_params,
+    ).fetchone()["c"]
+    waiting = db.execute(
+        f"SELECT COUNT(*) c FROM orders {order_where}"
+        f"{' AND' if order_where else ' WHERE'} status IN ('waiting_payment','waiting_review')",
+        order_params,
+    ).fetchone()["c"]
+    rejected = db.execute(
+        f"SELECT COUNT(*) c FROM orders {order_where}"
+        f"{' AND' if order_where else ' WHERE'} status='rejected'",
+        order_params,
+    ).fetchone()["c"]
+    money = db.execute(
+        f"SELECT COALESCE(SUM(amount),0) s FROM orders {order_where}"
+        f"{' AND' if order_where else ' WHERE'} status='completed'",
+        order_params,
+    ).fetchone()["s"]
+    receipt_where = "WHERE created_at >= ?" if reset_at else ""
+    receipt_params = (reset_at,) if reset_at else ()
+    receipt_count = db.execute(
+        f"SELECT COUNT(*) c FROM receipt_archive {receipt_where}",
+        receipt_params,
+    ).fetchone()["c"]
+    receipt_parsed = db.execute(
+        f"SELECT COUNT(*) c FROM receipt_archive {receipt_where}"
+        f"{' AND' if receipt_where else ' WHERE'} receipt_ocr_text IS NOT NULL "
+        f"AND receipt_ocr_text != ''",
+        receipt_params,
+    ).fetchone()["c"]
     recent_users = db.execute(
-        "SELECT id,username,first_name FROM users ORDER BY registered_at DESC,id DESC LIMIT 10"
+        f"SELECT id,username,first_name FROM users "
+        f"{user_where} ORDER BY registered_at DESC,id DESC LIMIT 10",
+        user_params,
     ).fetchall()
     user_lines = []
     for user in recent_users:
         label = f"@{esc(user['username'])}" if user["username"] else esc(user["first_name"] or "без username")
         user_lines.append(f"• {label} — <code>{user['id']}</code>")
     recent_user_list = "\n".join(user_lines) if user_lines else "Поки немає користувачів."
-    await call.message.answer(
+    period = (
+        f"з {esc(reset_at)}"
+        if reset_at
+        else "за весь час"
+    )
+    await message.answer(
         f"📊 <b>Статистика</b>\n\n"
+        f"🗓 Період: <b>{period}</b>\n\n"
         f"👥 Користувачів: {users}\n"
         f"📦 Замовлень: {orders}\n"
         f"✅ Виконано: {done}\n"
+        f"⏳ Очікують підтвердження: {waiting}\n"
+        f"🔴 Відхилено: {rejected}\n"
         f"💰 Підтверджено оплат: {money:.2f} грн\n\n"
+        f"🧾 Квитанцій: {receipt_count} (розпізнано: {receipt_parsed})\n\n"
         f"👤 <b>Останні користувачі</b>\n{recent_user_list}"
+        ,
+        reply_markup=stats_kb(),
     )
+
+
+@dp.callback_query(F.data == "adm:stats_reset")
+async def adm_stats_reset(call: CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+    reset_at = now()
+    # Statistics and receipt exports share one reporting period. Historical
+    # rows stay in the database, but the next export starts from this reset.
+    set_setting("stats_reset_at", reset_at)
+    set_setting("receipts_reset_at", reset_at)
+    await call.answer("Статистику та період квитанцій скинуто")
+    await render_admin_stats(call.message)
 
 
 @dp.callback_query(F.data == "adm:orders")
@@ -1659,8 +3483,10 @@ async def adm_orders(call: CallbackQuery):
     if call.from_user.id not in ADMIN_IDS:
         return
     await call.answer()
+    # The admin's "Замовлення" queue is only for receipts awaiting review.
+    # Orders that are still waiting for payment must not appear here.
     rows = db.execute(
-        "SELECT * FROM orders WHERE status IN ('waiting_payment','waiting_review') "
+        "SELECT * FROM orders WHERE status='waiting_review' "
         "ORDER BY id DESC LIMIT 30"
     ).fetchall()
     if not rows:
@@ -1908,42 +3734,85 @@ async def admin_ok(call: CallbackQuery):
         return
     await call.answer()
     oid = int(call.data.split(":")[1])
-    order = db.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
-    if not order or order["status"] not in ("waiting_review", "waiting_payment"):
-        await call.message.answer("Замовлення вже оброблене або не існує.")
-        return
+    stars_credited = None
+    raffle_offer = None
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        order = db.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+        if not order or order["status"] != "waiting_review":
+            db.rollback()
+            await call.message.answer("Замовлення вже оброблене або не існує.")
+            return
 
-    db.execute("UPDATE orders SET status='completed' WHERE id=?", (oid,))
-    if order["order_type"] == "buy_stars":
-        db.execute(
-            "UPDATE users SET balance_stars=balance_stars+?, bought_stars=bought_stars+?, spent_uah=spent_uah+?, status='Клієнт' WHERE id=?",
-            (int(order["quantity"]), int(order["quantity"]), order["amount"], order["user_id"]),
-        )
-    elif order["order_type"] == "buy_ton":
-        db.execute(
-            "UPDATE users SET bought_ton=bought_ton+?, spent_uah=spent_uah+?, status='Клієнт' WHERE id=?",
-            (float(order["quantity"]), order["amount"], order["user_id"]),
-        )
-    elif order["order_type"] == "nft":
-        db.execute(
-            "UPDATE users SET spent_uah=spent_uah+?, status='Клієнт' WHERE id=?",
-            (order["amount"], order["user_id"]),
-        )
-    elif order["order_type"] == "withdraw_stars":
-        db.execute(
-            "UPDATE users SET balance_stars=MAX(balance_stars-?,0) WHERE id=?",
-            (int(order["quantity"]), order["user_id"]),
-        )
-    db.commit()
+        if order["order_type"] == "buy_stars":
+            purchased_stars = int(order["quantity"])
+            raffle = active_raffle()
+            if raffle:
+                raffle_offer = raffle
+
+            # Every Stars top-up is credited in full first. A separate consent
+            # callback may debit only this exact order later.
+            stars_credited = purchased_stars
+            db.execute("UPDATE orders SET status='completed' WHERE id=?", (oid,))
+            db.execute(
+                """UPDATE users SET balance_stars=balance_stars+?, bought_stars=bought_stars+?,
+                   spent_uah=spent_uah+?, status='Клієнт' WHERE id=?""",
+                (stars_credited, purchased_stars, order["amount"], order["user_id"]),
+            )
+        elif order["order_type"] == "buy_ton":
+            db.execute("UPDATE orders SET status='completed' WHERE id=?", (oid,))
+            db.execute(
+                "UPDATE users SET bought_ton=bought_ton+?, spent_uah=spent_uah+?, status='Клієнт' WHERE id=?",
+                (float(order["quantity"]), order["amount"], order["user_id"]),
+            )
+        elif order["order_type"] == "nft":
+            db.execute("UPDATE orders SET status='completed' WHERE id=?", (oid,))
+            db.execute(
+                "UPDATE users SET spent_uah=spent_uah+?, status='Клієнт' WHERE id=?",
+                (order["amount"], order["user_id"]),
+            )
+        elif order["order_type"] == "withdraw_stars":
+            db.execute("UPDATE orders SET status='completed' WHERE id=?", (oid,))
+            db.execute(
+                "UPDATE users SET balance_stars=MAX(balance_stars-?,0) WHERE id=?",
+                (int(order["quantity"]), order["user_id"]),
+            )
+        else:
+            db.execute("UPDATE orders SET status='completed' WHERE id=?", (oid,))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
 
     await call.message.edit_reply_markup(reply_markup=None)
     await call.message.answer(f"{pe(EMOJI_POOL[5], '✅')} Замовлення #{oid} підтверджено.")
 
-    await bot.send_message(
-        order["user_id"],
-        f"{pe(EMOJI_POOL[5], '✅')} <b>Замовлення #{oid} підтверджено!</b>",
-        reply_markup=main_menu(),
-    )
+    if order["order_type"] == "buy_stars":
+        current_balance = user_row(order["user_id"])["balance_stars"]
+        user_text = (
+            f"{pe(EMOJI_POOL[5], '✅')} <b>Поповнення #{oid} підтверджено!</b>\n\n"
+            f"⭐ На баланс зараховано: <b>{stars_credited} Stars</b>\n"
+            f"💳 Поточний баланс: <b>{current_balance} Stars</b>"
+        )
+        await bot.send_message(order["user_id"], user_text, reply_markup=main_menu())
+
+        if raffle_offer:
+            current = db.execute(
+                "SELECT * FROM raffles WHERE id=? AND status='active'",
+                (raffle_offer["id"],),
+            ).fetchone()
+            if current:
+                await bot.send_message(
+                    order["user_id"],
+                    raffle_consent_text(current, order, order["user_id"]),
+                    reply_markup=raffle_consent_kb(current["id"], oid),
+                )
+    else:
+        await bot.send_message(
+            order["user_id"],
+            f"{pe(EMOJI_POOL[5], '✅')} <b>Замовлення #{oid} підтверджено!</b>",
+            reply_markup=main_menu(),
+        )
 
     if order["order_type"] == "nft" and order["nft_id"]:
         nft = db.execute("SELECT * FROM nfts WHERE id=?", (order["nft_id"],)).fetchone()
@@ -1977,8 +3846,9 @@ async def reject_reason(message: Message, state: FSMContext):
     oid = data.get("reject_order")
     reason = message.text or "Без причини"
     order = db.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
-    if not order:
+    if not order or order["status"] != "waiting_review":
         await state.clear()
+        await message.answer("❌ Це замовлення вже оброблене або не існує.")
         return
     db.execute(
         "UPDATE orders SET status='rejected',admin_note=? WHERE id=?",
@@ -2018,14 +3888,39 @@ async def fallback(message: Message, state: FSMContext):
     )
 
 
+async def start_health_server():
+    async def health(_request):
+        return web.Response(text="Spanix Stars Bot is running")
+
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "8765"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    return runner
+
+
 async def main():
     if not BOT_TOKEN:
         raise RuntimeError("Не задано BOT_TOKEN у Replit Secrets.")
+    print(f"SQLite database: {DB_PATH}")
     if not ADMIN_IDS:
         print("ADMIN_IDS не задано: надішліть боту /id, додайте ID в ADMIN_IDS і перезапустіть бота.")
-    await configure_bot_commands()
-    await start_health_server()
-    await dp.start_polling(bot)
+    global bot
+    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    health_runner = None
+    try:
+        await configure_bot_commands()
+        health_runner = await start_health_server()
+        await dp.start_polling(bot)
+    finally:
+        if health_runner is not None:
+            await health_runner.cleanup()
+        await bot.session.close()
+        bot = None
 
 
 if __name__ == "__main__":
