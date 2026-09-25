@@ -3913,8 +3913,8 @@ async def main():
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     health_runner = None
     try:
-        await configure_bot_commands()
         health_runner = await start_health_server()
+        await configure_bot_commands()
         await dp.start_polling(bot)
     finally:
         if health_runner is not None:
