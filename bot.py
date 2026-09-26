@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import sqlite3
+import shutil
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -49,12 +50,23 @@ for _admin_env_name in ("ADMIN_ID", "OWNER_ID"):
         ADMIN_IDS.add(int(_admin_env_value))
 BOT_NAME = "Spanix Stars"
 PROJECT_DIR = Path(__file__).resolve().parent
-DB_PATH = os.getenv("DB_PATH", str(PROJECT_DIR / "bot.db")).strip()
+RENDER_DISK_PATH = os.getenv("RENDER_DISK_PATH", "/var/data").strip()
+render_disk_dir = Path(RENDER_DISK_PATH).expanduser()
+default_db_path = (
+    render_disk_dir / "bot.db"
+    if render_disk_dir.is_dir()
+    else PROJECT_DIR / "bot.db"
+)
+configured_db_path = os.getenv("DB_PATH", "").strip()
+DB_PATH = configured_db_path or str(default_db_path)
 if DB_PATH != ":memory:":
     db_file = Path(DB_PATH).expanduser()
     if not db_file.is_absolute():
         db_file = PROJECT_DIR / db_file
     db_file.parent.mkdir(parents=True, exist_ok=True)
+    legacy_db_file = PROJECT_DIR / "bot.db"
+    if db_file != legacy_db_file and not db_file.exists() and legacy_db_file.exists():
+        shutil.copy2(legacy_db_file, db_file)
     DB_PATH = str(db_file.resolve())
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "@support")
 REVIEWS_URL = os.getenv("REVIEWS_URL", "https://t.me/")
@@ -3927,7 +3939,21 @@ async def main():
     try:
         health_runner = await start_health_server()
         await configure_bot_commands()
-        await dp.start_polling(bot)
+        retry_delay = 2
+        while True:
+            try:
+                await dp.start_polling(bot)
+                retry_delay = 2
+                print("Telegram polling stopped; restarting.")
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                print(
+                    f"Telegram polling failed: {type(error).__name__}: {error}. "
+                    f"Retrying in {retry_delay}s."
+                )
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 60)
     finally:
         if health_runner is not None:
             await health_runner.cleanup()
