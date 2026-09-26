@@ -1990,11 +1990,12 @@ async def start(message: Message, state: FSMContext):
         message.from_user.id,
         referral_start_id(message.text or ""),
     )
-    if not await is_user_subscribed(message.from_user.id):
-        await show_subscription_gate(message.from_user.id)
-        return
+    # The onboarding flow is intentional: language first, subscription second.
     if not user_row(message.from_user.id)["language_code"]:
         await show_language_picker(message.from_user.id)
+        return
+    if not await is_user_subscribed(message.from_user.id):
+        await show_subscription_gate(message.from_user.id)
         return
     await show_welcome(message.from_user.id)
 
@@ -2017,15 +2018,17 @@ async def choose_language(call: CallbackQuery):
     if language not in LANGUAGE_NAMES:
         await call.answer("Невідома мова.", show_alert=True)
         return
-    if not await is_user_subscribed(call.from_user.id):
-        await call.answer("Спочатку підпишіться на канал.", show_alert=True)
-        await show_subscription_gate(call.from_user.id)
-        return
+    # Save the language before showing the subscription gate so onboarding
+    # always follows: language -> channels -> verification -> main menu.
     db.execute(
         "UPDATE users SET language_code=? WHERE id=?",
         (language, call.from_user.id),
     )
     db.commit()
+    if not await is_user_subscribed(call.from_user.id):
+        await call.answer("Мову збережено. Спочатку підпишіться на канали.")
+        await show_subscription_gate(call.from_user.id)
+        return
     await call.answer(f"Обрано: {LANGUAGE_NAMES[language]}")
     await show_welcome(call.from_user.id)
 
