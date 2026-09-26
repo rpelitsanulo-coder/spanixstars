@@ -935,8 +935,13 @@ def now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-db = sqlite3.connect(DB_PATH)
+db = sqlite3.connect(DB_PATH, timeout=30)
 db.row_factory = sqlite3.Row
+# Keep the database durable across async handlers and Render restarts.
+db.execute("PRAGMA busy_timeout=5000")
+db.execute("PRAGMA journal_mode=WAL")
+db.execute("PRAGMA synchronous=FULL")
+db.execute("PRAGMA foreign_keys=ON")
 
 db.executescript(
     """
@@ -1434,7 +1439,10 @@ def main_menu(language="uk"):
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
-ASSET_DIR = Path(__file__).resolve().parent / "assets"
+ASSET_DIRS = (
+    PROJECT_DIR / "assets",
+    PROJECT_DIR / "attached_assets",
+)
 
 SCREEN_IMAGES = {
     "welcome": "0DAC8ABF-4E80-4DAC-9765-68EBFE20BAD1_1790276163145.png",
@@ -1447,6 +1455,21 @@ SCREEN_IMAGES = {
     "calculator": "IMG_0468_1790276163150.jpeg",
     "reviews": "IMG_0469_1790276163150.jpeg",
 }
+
+
+def find_asset(image_name):
+    if not image_name:
+        return None
+    for asset_dir in ASSET_DIRS:
+        exact_path = asset_dir / image_name
+        if exact_path.is_file():
+            return exact_path
+        # GitHub exports may preserve the asset UUID but change the timestamp suffix.
+        prefix = image_name.split("_", 1)[0]
+        matches = sorted(asset_dir.glob(f"{prefix}_*"))
+        if matches:
+            return matches[0]
+    return None
 
 
 async def replace_screen(
@@ -1471,7 +1494,7 @@ async def replace_screen(
             pass
 
     image_name = SCREEN_IMAGES.get(image) if image else None
-    image_path = ASSET_DIR / image_name if image_name else None
+    image_path = find_asset(image_name)
     if image_path and image_path.is_file():
         sent = await bot.send_photo(
             chat_id=user_id,
