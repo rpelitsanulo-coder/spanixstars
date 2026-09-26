@@ -1,5 +1,6 @@
 import asyncio
 import csv
+import copy
 import difflib
 import html
 import json
@@ -1213,6 +1214,165 @@ MENU_LABELS = {
 }
 
 
+UI_TRANSLATIONS = {
+    "ru": {
+        "Оберіть потрібний розділ нижче 👇": "Выберите нужный раздел ниже 👇",
+        "Головне меню": "Главное меню",
+        "Оберіть кількість Stars": "Выберите количество Stars",
+        "Актуальний курс": "Актуальный курс",
+        "Вкажіть кількість Stars від": "Укажите количество Stars от",
+        "Кількість:": "Количество:",
+        "Оберіть спосіб оплати": "Выберите способ оплаты",
+        "Замовлення не знайдено.": "Заказ не найден.",
+        "Оберіть банк для оплати": "Выберите банк для оплаты",
+        "Реквізити:": "Реквизиты:",
+        "Після оплати надішліть квитанцію.": "После оплаты отправьте квитанцию.",
+        "Замовлення більше недоступне.": "Заказ больше недоступен.",
+        "Спочатку оберіть банк для цього замовлення.": "Сначала выберите банк для этого заказа.",
+        "Надішліть фото або документ квитанції.": "Отправьте фото или документ квитанции.",
+        "Квитанцію отримано.": "Квитанция получена.",
+        "передано на перевірку.": "передан на проверку.",
+        "Дію скасовано.": "Действие отменено.",
+        "Вкажіть кількість TON для покупки.": "Укажите количество TON для покупки.",
+        "Мінімальна кількість:": "Минимальное количество:",
+        "Введіть коректну кількість TON від": "Введите корректное количество TON от",
+        "Ваш баланс:": "Ваш баланс:",
+        "Мінімум для виводу:": "Минимум для вывода:",
+        "Вкажіть кількість Stars для виводу.": "Укажите количество Stars для вывода.",
+        "Недостатньо коштів": "Недостаточно средств",
+        "Запит на вивід": "Запрос на вывод",
+        "Очікуйте обробки заявки адміністратором.": "Ожидайте обработки заявки администратором.",
+        "Вкажіть кількість Stars, яку бажаєте продати.": "Укажите количество Stars, которое хотите продать.",
+        "Запит на продаж": "Запрос на продажу",
+        "Для отримання реквізитів зверніться до підтримки:": "Для получения реквизитов обратитесь в поддержку:",
+        "Наразі доступних NFT немає.": "Сейчас доступных NFT нет.",
+        "Оберіть NFT зі списку.": "Выберите NFT из списка.",
+        "Цей NFT більше недоступний.": "Этот NFT больше недоступен.",
+        "Ваш профіль": "Ваш профиль",
+        "Придбано Stars:": "Куплено Stars:",
+        "Придбано TON:": "Куплено TON:",
+        "Витрачено:": "Потрачено:",
+        "Запрошено друзів:": "Приглашено друзей:",
+        "Дата реєстрації:": "Дата регистрации:",
+        "Вкажіть кількість Stars для розрахунку.": "Укажите количество Stars для расчёта.",
+        "Розрахунок": "Расчёт",
+        "Відгуки наших клієнтів": "Отзывы наших клиентов",
+        "Тут ви можете переглянути відгуки наших клієнтів 👇": "Здесь вы можете посмотреть отзывы наших клиентов 👇",
+        "Опишіть ваше питання або проблему": "Опишите ваш вопрос или проблему",
+        "За потреби можете додати фото або відео.": "При необходимости добавьте фото или видео.",
+        "Звернення передано в підтримку.": "Обращение передано в поддержку.",
+        "Назад": "Назад",
+        "Скасувати": "Отмена",
+        "Українська картка": "Украинская карта",
+        "Я оплатив — надіслати квитанцію": "Я оплатил — отправить квитанцию",
+        "Оновити": "Обновить",
+        "Підписатися:": "Подписаться:",
+        "Перевірити підписку": "Проверить подписку",
+        "Спочатку підпишіться на наші Telegram-канали": "Сначала подпишитесь на наши Telegram-каналы",
+        "Після підписки натисніть «Перевірити підписку».": "После подписки нажмите «Проверить подписку».",
+        "До оплати:": "К оплате:",
+        "Власна кількість Stars": "Своё количество Stars",
+        "Скасувати замовлення": "Отменить заказ",
+        "Вартість:": "Стоимость:",
+        "Придбано Stars:": "Куплено Stars:",
+        "Придбано TON:": "Куплено TON:",
+        "Запрошено друзів:": "Приглашено друзей:",
+        "Зароблено з рефералів:": "Заработано с рефералов:",
+        "🔗 <b>Ваша реферальна ссылка:</b>": "🔗 <b>Ваша реферальная ссылка:</b>",
+        "Введіть коректну кількість Stars від": "Введите корректное количество Stars от",
+        "Вкажіть коректну кількість Stars.": "Укажите корректное количество Stars.",
+        "Введіть коректне ціле число.": "Введите корректное целое число.",
+    },
+    "en": {
+        "Оберіть потрібний розділ нижче 👇": "Choose a section below 👇",
+        "Головне меню": "Main menu",
+        "Оберіть кількість Stars": "Choose the number of Stars",
+        "Актуальний курс": "Current rate",
+        "Вкажіть кількість Stars від": "Enter the number of Stars from",
+        "Кількість:": "Quantity:",
+        "Оберіть спосіб оплати": "Choose a payment method",
+        "Замовлення не знайдено.": "Order not found.",
+        "Оберіть банк для оплати": "Choose a bank for payment",
+        "Реквізити:": "Payment details:",
+        "Після оплати надішліть квитанцію.": "Send the receipt after payment.",
+        "Замовлення більше недоступне.": "This order is no longer available.",
+        "Спочатку оберіть банк для цього замовлення.": "Choose a bank for this order first.",
+        "Надішліть фото або документ квитанції.": "Send a receipt photo or document.",
+        "Квитанцію отримано.": "Receipt received.",
+        "передано на перевірку.": "sent for review.",
+        "Дію скасовано.": "Action cancelled.",
+        "Вкажіть кількість TON для покупки.": "Enter the amount of TON to buy.",
+        "Мінімальна кількість:": "Minimum amount:",
+        "Введіть коректну кількість TON від": "Enter a valid amount of TON from",
+        "Ваш баланс:": "Your balance:",
+        "Мінімум для виводу:": "Minimum withdrawal:",
+        "Вкажіть кількість Stars для виводу.": "Enter the number of Stars to withdraw.",
+        "Недостатньо коштів": "Insufficient balance",
+        "Запит на вивід": "Withdrawal request",
+        "Очікуйте обробки заявки адміністратором.": "Please wait for the administrator to process your request.",
+        "Вкажіть кількість Stars, яку бажаєте продати.": "Enter the number of Stars you want to sell.",
+        "Запит на продаж": "Sell request",
+        "Для отримання реквізитів зверніться до підтримки:": "Contact support to receive payment details:",
+        "Наразі доступних NFT немає.": "There are no NFTs available right now.",
+        "Оберіть NFT зі списку.": "Choose an NFT from the list.",
+        "Цей NFT більше недоступний.": "This NFT is no longer available.",
+        "Ваш профіль": "Your profile",
+        "Придбано Stars:": "Stars purchased:",
+        "Придбано TON:": "TON purchased:",
+        "Витрачено:": "Spent:",
+        "Запрошено друзів:": "Friends invited:",
+        "Дата реєстрації:": "Registration date:",
+        "Вкажіть кількість Stars для розрахунку.": "Enter the number of Stars to calculate.",
+        "Розрахунок": "Calculation",
+        "Відгуки наших клієнтів": "Customer reviews",
+        "Тут ви можете переглянути відгуки наших клієнтів 👇": "View customer reviews here 👇",
+        "Опишіть ваше питання або проблему": "Describe your question or problem",
+        "За потреби можете додати фото або відео.": "You can add a photo or video if needed.",
+        "Звернення передано в підтримку.": "Your request was sent to support.",
+        "Назад": "Back",
+        "Скасувати": "Cancel",
+        "Українська картка": "Ukrainian card",
+        "Я оплатив — надіслати квитанцію": "I paid — send receipt",
+        "Оновити": "Refresh",
+        "Підписатися:": "Subscribe:",
+        "Перевірити підписку": "Check subscription",
+        "Спочатку підпишіться на наші Telegram-канали": "Subscribe to our Telegram channels first",
+        "Після підписки натисніть «Перевірити підписку».": "After subscribing, press “Check subscription”.",
+        "До оплати:": "Amount to pay:",
+        "Власна кількість Stars": "Custom number of Stars",
+        "Скасувати замовлення": "Cancel order",
+        "Вартість:": "Price:",
+        "Придбано Stars:": "Stars purchased:",
+        "Придбано TON:": "TON purchased:",
+        "Запрошено друзів:": "Friends invited:",
+        "Зароблено з рефералів:": "Referral earnings:",
+        "🔗 <b>Ваша реферальна ссылка:</b>": "🔗 <b>Your referral link:</b>",
+        "Введіть коректну кількість Stars від": "Enter a valid number of Stars from",
+        "Вкажіть коректну кількість Stars.": "Enter a valid number of Stars.",
+        "Введіть коректне ціле число.": "Enter a valid whole number.",
+    }
+}
+
+
+def localize_ui_text(text, language):
+    translations = UI_TRANSLATIONS.get(language, {})
+    for source, target in sorted(translations.items(), key=lambda item: len(item[0]), reverse=True):
+        text = text.replace(source, target)
+    return text
+
+
+def localize_markup(markup, language):
+    if not markup or language == "uk":
+        return markup
+    localized = copy.deepcopy(markup)
+    rows = getattr(localized, "keyboard", None) or getattr(localized, "inline_keyboard", None)
+    for row in rows or []:
+        for button in row:
+            if getattr(button, "text", None):
+                button.text = localize_ui_text(button.text, language)
+    return localized
+
+
 def user_language(uid):
     row = user_row(uid)
     language = row["language_code"] if row else ""
@@ -1445,15 +1605,16 @@ ASSET_DIRS = (
 )
 
 SCREEN_IMAGES = {
-    "welcome": "0DAC8ABF-4E80-4DAC-9765-68EBFE20BAD1_1790276163145.png",
-    "stars": "8F1E5F14-6C85-481A-89C0-CB8DDB51C6E7_1790276163149.png",
-    "ton": "CBAC6203-7823-4978-B81E-835F062AFBAE_1790276163149.png",
-    "nft": "IMG_0464_1790276163150.jpeg",
-    "sell": "IMG_0465_1790276163150.jpeg",
-    "support": "IMG_0466_1790276163150.jpeg",
-    "withdraw": "IMG_0467_1790276163150.jpeg",
-    "calculator": "IMG_0468_1790276163150.jpeg",
-    "reviews": "IMG_0469_1790276163150.jpeg",
+    # One exact asset per customer-facing section.
+    "welcome": "0DAC8ABF-4E80-4DAC-9765-68EBFE20BAD1_1790343358458.png",
+    "stars": "8F1E5F14-6C85-481A-89C0-CB8DDB51C6E7_1790343358459.png",
+    "ton": "CBAC6203-7823-4978-B81E-835F062AFBAE_1790343358459.png",
+    "nft": "IMG_0464_1790343358459.jpeg",
+    "sell": "IMG_0465_1790343358459.jpeg",
+    "support": "IMG_0466_1790343358459.jpeg",
+    "withdraw": "IMG_0467_1790343358459.jpeg",
+    "calculator": "IMG_0468_1790343358459.jpeg",
+    "reviews": "IMG_0469_1790343358459.jpeg",
 }
 
 
@@ -1493,6 +1654,9 @@ async def replace_screen(
         except Exception:
             pass
 
+    language = user_language(user_id)
+    text = localize_ui_text(text, language)
+    reply_markup = localize_markup(reply_markup, language)
     image_name = SCREEN_IMAGES.get(image) if image else None
     image_path = find_asset(image_name)
     if image_path and image_path.is_file():
