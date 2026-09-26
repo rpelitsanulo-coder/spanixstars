@@ -64,10 +64,25 @@ if DB_PATH != ":memory:":
     db_file = Path(DB_PATH).expanduser()
     if not db_file.is_absolute():
         db_file = PROJECT_DIR / db_file
-    db_file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        db_file.parent.mkdir(parents=True, exist_ok=True)
+        probe_file = db_file.parent / f".{db_file.name}.write-test"
+        probe_file.touch(exist_ok=True)
+        probe_file.unlink(missing_ok=True)
+    except OSError as error:
+        fallback_db_file = PROJECT_DIR / "bot.db"
+        fallback_db_file.parent.mkdir(parents=True, exist_ok=True)
+        print(
+            f"Database path {db_file} is unavailable ({error}). "
+            f"Using fallback {fallback_db_file}."
+        )
+        db_file = fallback_db_file
     legacy_db_file = PROJECT_DIR / "bot.db"
     if db_file != legacy_db_file and not db_file.exists() and legacy_db_file.exists():
-        shutil.copy2(legacy_db_file, db_file)
+        try:
+            shutil.copy2(legacy_db_file, db_file)
+        except OSError as error:
+            print(f"Could not migrate legacy database to {db_file}: {error}")
     DB_PATH = str(db_file.resolve())
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "@support")
 REVIEWS_URL = os.getenv("REVIEWS_URL", "https://t.me/")
