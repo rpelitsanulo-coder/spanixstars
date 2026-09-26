@@ -9,6 +9,7 @@ import re
 import secrets
 import sqlite3
 import shutil
+import time
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -88,16 +89,26 @@ if DB_PATH != ":memory:":
     DB_PATH = str(db_file.resolve())
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "@support")
 REVIEWS_URL = os.getenv("REVIEWS_URL", "https://t.me/")
-KEEPALIVE_URL = os.getenv("KEEPALIVE_URL", "").strip()
-try:
-    KEEPALIVE_INTERVAL = max(300, int(os.getenv("KEEPALIVE_INTERVAL", "600")))
-except ValueError:
-    KEEPALIVE_INTERVAL = 600
 WEBHOOK_URL = (
     os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL") or ""
 ).strip().rstrip("/")
 WEBHOOK_PATH = "/telegram/webhook"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+KEEPALIVE_URL = (
+    os.getenv("KEEPALIVE_URL")
+    or (f"{WEBHOOK_URL}/health" if WEBHOOK_URL else "")
+).strip().rstrip("/")
+try:
+    KEEPALIVE_INTERVAL = max(300, int(os.getenv("KEEPALIVE_INTERVAL", "600")))
+except ValueError:
+    KEEPALIVE_INTERVAL = 600
+try:
+    KEEPALIVE_IDLE_TIMEOUT = max(
+        KEEPALIVE_INTERVAL,
+        int(os.getenv("KEEPALIVE_IDLE_TIMEOUT", "900")),
+    )
+except ValueError:
+    KEEPALIVE_IDLE_TIMEOUT = max(KEEPALIVE_INTERVAL, 900)
 # Comma/semicolon-separated channel configuration. Each item can be:
 #   @public_channel
 #   -1001234567890|https://t.me/+invite_link|Channel title
@@ -2075,9 +2086,21 @@ class Form(StatesGroup):
 # have been configured.
 bot: Bot | None = None
 dp = Dispatcher()
+last_activity_at = 0.0
 _processed_start_messages: set[tuple[int, int]] = set()
 _last_start_at: dict[int, float] = {}
 START_DEDUP_SECONDS = 2.0
+
+
+def mark_bot_activity():
+    global last_activity_at
+    last_activity_at = time.monotonic()
+
+
+class ActivityMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        mark_bot_activity()
+        return await handler(event, data)
 
 
 class SubscriptionMiddleware(BaseMiddleware):
@@ -2106,6 +2129,7 @@ class SubscriptionMiddleware(BaseMiddleware):
         return None
 
 
+dp.update.outer_middleware(ActivityMiddleware())
 dp.message.outer_middleware(SubscriptionMiddleware())
 dp.callback_query.outer_middleware(SubscriptionMiddleware())
 
@@ -4773,13 +4797,27 @@ async def start_health_server():
 
 async def keepalive_loop():
     if not KEEPALIVE_URL:
-        print("Self-ping disabled: set KEEPALIVE_URL in Render Environment to enable it.")
+        print("Self-ping disabled: Render URL is not configured.")
         return
 
     timeout = ClientTimeout(total=20)
+    idle_logged = False
     async with ClientSession(timeout=timeout) as session:
         while True:
             await asyncio.sleep(KEEPALIVE_INTERVAL)
+            if last_activity_at <= 0:
+                continue
+
+            idle_for = time.monotonic() - last_activity_at
+            if idle_for >= KEEPALIVE_IDLE_TIMEOUT:
+                if not idle_logged:
+                    print(
+                        f"Self-ping paused after {int(idle_for)}s without Telegram activity."
+                    )
+                    idle_logged = True
+                continue
+
+            idle_logged = False
             try:
                 async with session.get(
                     KEEPALIVE_URL,
