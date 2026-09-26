@@ -1219,11 +1219,7 @@ def menu_text(key, language):
 
 
 def parse_required_channels(raw_value=None):
-    raw = (
-        (setting("required_channels") or REQUIRED_CHANNELS)
-        if raw_value is None
-        else raw_value
-    )
+    raw = setting("required_channels") if raw_value is None else raw_value
     channels = []
     for item in re.split(r"[\n,;]+", raw or ""):
         item = item.strip()
@@ -1251,6 +1247,13 @@ def parse_required_channels(raw_value=None):
             url = f"https://t.me/{chat_id[1:]}"
         channels.append({"chat_id": chat_id, "url": url, "title": title})
     return channels
+
+
+def serialize_required_channels(channels):
+    return "\n".join(
+        f"{channel['chat_id']}|{channel['url']}|{channel['title']}"
+        for channel in channels
+    )
 
 
 def referral_start_id(raw_text):
@@ -1743,6 +1746,7 @@ def admin_menu_kb():
         ("Розсилка", EMOJI_POOL[16], "primary", "adm:broadcast"),
         ("Підтримка", MAIN_EMOJI["support"], "success", "adm:support"),
         ("Канал відгуків", MAIN_EMOJI["reviews"], "primary", "adm:reviews"),
+        ("Обов'язкова підписка", EMOJI_POOL[0], "success", "adm:channels"),
         ("Підтвердження оплат", EMOJI_POOL[16], "primary", "adm:orders"),
         ("Користувачі", EMOJI_POOL[3], "primary", "adm:users"),
         ("Статистика", EMOJI_POOL[27], "primary", "adm:stats"),
@@ -1750,6 +1754,25 @@ def admin_menu_kb():
     ]
     for text, eid, style, data in items:
         b.row(kb_button(text, emoji_id=eid, style=style, callback_data=data))
+    return b.as_markup()
+
+
+def required_channels_admin_kb():
+    b = InlineKeyboardBuilder()
+    for index, channel in enumerate(parse_required_channels()):
+        b.row(kb_button(
+            f"🗑 {channel['title']}",
+            emoji_id=EMOJI_POOL[3],
+            style="danger",
+            callback_data=f"adm_channel_delete:{index}",
+        ))
+    b.row(kb_button(
+        "➕ Додати канал",
+        emoji_id=EMOJI_POOL[0],
+        style="success",
+        callback_data="adm:channels:add",
+    ))
+    b.row(back_inline("admin:back"))
     return b.as_markup()
 
 
@@ -1824,6 +1847,7 @@ class Form(StatesGroup):
     balance_amount = State()
     raffle_target = State()
     raffle_rules = State()
+    required_channel = State()
 
 
 # The token is supplied through Replit Secrets. Keep Bot construction lazy so
@@ -3298,6 +3322,128 @@ async def set_reviews(message: Message, state: FSMContext):
     set_setting("reviews_url", url)
     await state.clear()
     await message.answer("✅ Канал відгуків оновлено.", reply_markup=admin_menu_kb())
+
+
+@dp.callback_query(F.data == "adm:channels")
+async def adm_channels(call: CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+    await call.answer()
+    channels = parse_required_channels()
+    if channels:
+        listing = "\n".join(
+            f"• <b>{esc(channel['title'])}</b> — <code>{esc(channel['chat_id'])}</code>"
+            for channel in channels
+        )
+    else:
+        listing = "Поки що канали не додані."
+    await call.message.answer(
+        "🔒 <b>Обов'язкова підписка</b>\n\n"
+        f"{listing}\n\n"
+        "Бот перевіряє підписку через Telegram API. Для кожного каналу "
+        "бот має бути адміністратором.",
+        reply_markup=required_channels_admin_kb(),
+    )
+
+
+@dp.callback_query(F.data == "adm:channels:add")
+async def adm_channels_add(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+    await call.answer()
+    await state.set_state(Form.required_channel)
+    await call.message.answer(
+        "➕ <b>Додати канал для обов'язкової підписки</b>\n\n"
+        "Надішліть одним повідомленням:\n"
+        "• публічний: <code>@channel</code>\n"
+        "• приватний: <code>-1001234567890|https://t.me/+invite|Назва</code>\n\n"
+        "Для приватного каналу потрібні ID чату, посилання-запрошення та назва. "
+        "Перед додаванням переконайтеся, що бот уже адміністратор.",
+        reply_markup=cancel_kb(),
+    )
+
+
+@dp.message(Form.required_channel)
+async def set_required_channel(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    raw_value = (message.text or "").strip()
+    channels = parse_required_channels(raw_value)
+    if len(channels) != 1:
+        await message.answer(
+            "❌ Не вдалося розпізнати канал. Використайте @username або "
+            "ID|ссылка-приглашение|название."
+        )
+        return
+    channel = channels[0]
+    if not (
+        channel["chat_id"].startswith("@")
+        or re.fullmatch(r"-?\d+", channel["chat_id"])
+    ):
+        await message.answer("❌ ID каналу має починатися з @ або бути числовим.")
+        return
+    if not channel["url"]:
+        await message.answer(
+            "❌ Для цього каналу немає кнопки підписки. Додайте посилання "
+            "https://t.me/... після ID через символ |."
+        )
+        return
+    if any(item["chat_id"] == channel["chat_id"] for item in parse_required_channels()):
+        await message.answer("⚠️ Цей канал уже є у списку обов'язкової підписки.")
+        return
+
+    try:
+        bot_info = await bot.get_me()
+        bot_member = await bot.get_chat_member(channel["chat_id"], bot_info.id)
+        if bot_member.status not in ("creator", "administrator"):
+            await message.answer(
+                "❌ Бот знайдений у каналі, але не має прав адміністратора. "
+                "Спочатку призначте його адміністратором."
+            )
+            return
+    except Exception as error:
+        print(
+            f"Required channel validation failed for {channel['chat_id']}: "
+            f"{type(error).__name__}: {error}",
+            flush=True,
+        )
+        await message.answer(
+            "❌ Не вдалося перевірити канал. Переконайтеся, що ID правильний "
+            "і бот уже доданий до каналу адміністратором."
+        )
+        return
+
+    updated_channels = parse_required_channels()
+    updated_channels.append(channel)
+    set_setting("required_channels", serialize_required_channels(updated_channels))
+    await state.clear()
+    await message.answer(
+        f"✅ Канал <b>{esc(channel['title'])}</b> додано. "
+        "Перевірка підписки вже активна.",
+        reply_markup=admin_menu_kb(),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm_channel_delete:"))
+async def delete_required_channel(call: CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        index = int(call.data.split(":", 1)[1])
+    except (TypeError, ValueError):
+        await call.answer("Некоректний канал.", show_alert=True)
+        return
+    channels = parse_required_channels()
+    if index < 0 or index >= len(channels):
+        await call.answer("Канал уже видалений.", show_alert=True)
+        return
+    removed = channels.pop(index)
+    set_setting("required_channels", serialize_required_channels(channels))
+    await call.answer("Канал видалено")
+    await call.message.answer(
+        f"✅ Канал <b>{esc(removed['title'])}</b> видалено зі списку.",
+        reply_markup=required_channels_admin_kb(),
+    )
 
 
 @dp.callback_query(F.data == "adm:bank_details")
