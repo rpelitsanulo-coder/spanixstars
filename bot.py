@@ -19,6 +19,7 @@ from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from aiogram.types import (
     BotCommand,
     BotCommandScopeAllPrivateChats,
@@ -96,6 +97,11 @@ WEBHOOK_URL = (
 ).strip().rstrip("/")
 WEBHOOK_PATH = "/telegram/webhook"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+# Comma/semicolon-separated channel configuration. Each item can be:
+#   @public_channel
+#   -1001234567890|https://t.me/+invite_link|Channel title
+# The bot must be an administrator in every configured channel.
+REQUIRED_CHANNELS = os.getenv("REQUIRED_CHANNELS", "").strip()
 
 BANK_DETAILS = {
     "private": os.getenv("PRIVATE_DETAILS", "Реквізити Privat24 не налаштовані."),
@@ -944,6 +950,9 @@ CREATE TABLE IF NOT EXISTS users (
     premium_months INTEGER DEFAULT 0,
     spent_uah REAL DEFAULT 0,
     invited INTEGER DEFAULT 0,
+    referrer_id INTEGER,
+    referral_earned_stars INTEGER DEFAULT 0,
+    language_code TEXT DEFAULT '',
     status TEXT DEFAULT 'Новачок',
     registered_at TEXT
 );
@@ -1051,6 +1060,16 @@ CREATE TABLE IF NOT EXISTS raffle_consents (
     created_at TEXT NOT NULL,
     PRIMARY KEY (raffle_id, order_id)
 );
+
+CREATE TABLE IF NOT EXISTS referral_rewards (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL UNIQUE,
+    referrer_id INTEGER NOT NULL,
+    referred_user_id INTEGER NOT NULL,
+    purchased_stars INTEGER NOT NULL,
+    bonus_stars INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
 """)
 
 def ensure_column(table: str, column: str, definition: str):
@@ -1069,6 +1088,9 @@ ensure_column("nfts", "sticker_file_id", "TEXT")
 ensure_column("nfts", "sticker_type", "TEXT")
 ensure_column("nfts", "custom_emoji_id", "TEXT")
 ensure_column("ui_messages", "screen_key", "TEXT")
+ensure_column("users", "referrer_id", "INTEGER")
+ensure_column("users", "referral_earned_stars", "INTEGER DEFAULT 0")
+ensure_column("users", "language_code", "TEXT DEFAULT ''")
 
 # Preserve receipts saved by an earlier version before the archive table
 # existed. This migration is idempotent for each order/file pair.
@@ -1104,6 +1126,7 @@ DEFAULTS = {
     # This is an archive checkpoint, not a data deletion flag. Resetting the
     # receipts screen keeps the source records available in the database.
     "receipts_reset_at": "",
+    "required_channels": REQUIRED_CHANNELS,
 }
 for method, details in BANK_DETAILS.items():
     DEFAULTS[f"bank_{method}"] = details
@@ -1146,6 +1169,126 @@ def user_row(uid):
     return db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
 
 
+LANGUAGE_NAMES = {
+    "uk": "Українська",
+    "ru": "Русский",
+    "en": "English",
+}
+
+MENU_LABELS = {
+    "buy_stars": {
+        "uk": "Купити Stars",
+        "ru": "Купить Stars",
+        "en": "Buy Stars",
+    },
+    "buy_ton": {
+        "uk": "Купити TON",
+        "ru": "Купить TON",
+        "en": "Buy TON",
+    },
+    "nft": {"uk": "NFT", "ru": "NFT", "en": "NFT"},
+    "withdraw_stars": {
+        "uk": "Вивести Stars",
+        "ru": "Вывести Stars",
+        "en": "Withdraw Stars",
+    },
+    "sell_stars": {
+        "uk": "Продати Stars",
+        "ru": "Продать Stars",
+        "en": "Sell Stars",
+    },
+    "profile": {"uk": "Профіль", "ru": "Профиль", "en": "Profile"},
+    "calculator": {
+        "uk": "Калькулятор",
+        "ru": "Калькулятор",
+        "en": "Calculator",
+    },
+    "reviews": {"uk": "Відгуки", "ru": "Отзывы", "en": "Reviews"},
+    "support": {"uk": "Підтримка", "ru": "Поддержка", "en": "Support"},
+}
+
+
+def user_language(uid):
+    row = user_row(uid)
+    language = row["language_code"] if row else ""
+    return language if language in LANGUAGE_NAMES else "uk"
+
+
+def menu_text(key, language):
+    return MENU_LABELS[key].get(language, MENU_LABELS[key]["uk"])
+
+
+def parse_required_channels(raw_value=None):
+    raw = (
+        (setting("required_channels") or REQUIRED_CHANNELS)
+        if raw_value is None
+        else raw_value
+    )
+    channels = []
+    for item in re.split(r"[\n,;]+", raw or ""):
+        item = item.strip()
+        if not item:
+            continue
+        parts = [part.strip() for part in item.split("|", 2)]
+        chat_id = parts[0]
+        url = ""
+        title = chat_id
+        if len(parts) > 1:
+            url = parts[1]
+        if len(parts) > 2 and parts[2]:
+            title = parts[2]
+        if chat_id.startswith(("https://t.me/", "http://t.me/")):
+            url = chat_id
+            chat_id = chat_id.rstrip("/").rsplit("/", 1)[-1]
+            if not chat_id.startswith("@"):
+                chat_id = f"@{chat_id.split('+', 1)[0]}"
+        elif chat_id.startswith("t.me/"):
+            url = f"https://{chat_id}"
+            chat_id = chat_id.rstrip("/").rsplit("/", 1)[-1]
+            if not chat_id.startswith("@"):
+                chat_id = f"@{chat_id.split('+', 1)[0]}"
+        elif chat_id.startswith("@") and not url:
+            url = f"https://t.me/{chat_id[1:]}"
+        channels.append({"chat_id": chat_id, "url": url, "title": title})
+    return channels
+
+
+def referral_start_id(raw_text):
+    match = re.match(r"^/start(?:@\w+)?(?:\s+(.+))?$", raw_text or "", re.IGNORECASE)
+    payload = (match.group(1) or "").strip() if match else ""
+    if payload.startswith("ref_") and payload[4:].isdigit():
+        return int(payload[4:])
+    return None
+
+
+def register_referral(user_id, referrer_id):
+    if not referrer_id or referrer_id == user_id:
+        return False
+    ensure_user_referrer = db.execute(
+        "SELECT referrer_id FROM users WHERE id=?", (user_id,)
+    ).fetchone()
+    if not ensure_user_referrer or ensure_user_referrer["referrer_id"]:
+        return False
+    if not user_row(referrer_id):
+        return False
+    db.execute(
+        "UPDATE users SET referrer_id=? WHERE id=? AND referrer_id IS NULL",
+        (referrer_id, user_id),
+    )
+    db.execute(
+        "UPDATE users SET invited=invited+1 WHERE id=?",
+        (referrer_id,),
+    )
+    db.commit()
+    return True
+
+
+def referral_link(username, user_id):
+    if not username:
+        return f"https://t.me/?start=ref_{user_id}"
+    return f"https://t.me/{username.lstrip('@')}?start=ref_{user_id}"
+
+
 def find_user_by_identifier(identifier):
     value = identifier.strip()
     if value.startswith("@"):
@@ -1168,6 +1311,42 @@ def create_order(uid, order_type, quantity, amount, nft_id=None):
     )
     db.commit()
     return cur.lastrowid
+
+
+def credit_referral_bonus(order_id, buyer_id, purchased_stars):
+    buyer = db.execute(
+        "SELECT referrer_id FROM users WHERE id=?", (buyer_id,)
+    ).fetchone()
+    referrer_id = buyer["referrer_id"] if buyer else None
+    if not referrer_id or referrer_id == buyer_id:
+        return None, 0
+    bonus_stars = int(purchased_stars) * 10 // 100
+    if bonus_stars <= 0:
+        return None, 0
+    cur = db.execute(
+        """INSERT OR IGNORE INTO referral_rewards(
+               order_id,referrer_id,referred_user_id,purchased_stars,
+               bonus_stars,created_at
+           ) VALUES(?,?,?,?,?,?)""",
+        (
+            order_id,
+            referrer_id,
+            buyer_id,
+            int(purchased_stars),
+            bonus_stars,
+            now(),
+        ),
+    )
+    if cur.rowcount == 0:
+        return referrer_id, 0
+    db.execute(
+        """UPDATE users
+           SET balance_stars=balance_stars+?,
+               referral_earned_stars=referral_earned_stars+?
+           WHERE id=?""",
+        (bonus_stars, bonus_stars, referrer_id),
+    )
+    return referrer_id, bonus_stars
 
 
 def active_raffle():
@@ -1230,22 +1409,23 @@ def reply_button(text, *, emoji_id=None, style=None):
     return KeyboardButton(**kwargs)
 
 
-def main_menu():
+def main_menu(language="uk"):
+    language = language if language in LANGUAGE_NAMES else "uk"
     rows = [
         [
-            reply_button("Купити Stars", emoji_id=MAIN_EMOJI["buy_stars"], style="danger"),
-            reply_button("Купити TON", emoji_id=MAIN_EMOJI["buy_gram"], style="danger"),
-            reply_button("NFT", emoji_id=MAIN_EMOJI["nft"], style="danger"),
+            reply_button(menu_text("buy_stars", language), emoji_id=MAIN_EMOJI["buy_stars"], style="danger"),
+            reply_button(menu_text("buy_ton", language), emoji_id=MAIN_EMOJI["buy_gram"], style="danger"),
+            reply_button(menu_text("nft", language), emoji_id=MAIN_EMOJI["nft"], style="danger"),
         ],
         [
-            reply_button("Вивести Stars", emoji_id=MAIN_EMOJI["withdraw_stars"], style="success"),
-            reply_button("Продати Stars", emoji_id=MAIN_EMOJI["sell_stars"], style="success"),
-            reply_button("Профіль", emoji_id=MAIN_EMOJI["profile"], style="success"),
+            reply_button(menu_text("withdraw_stars", language), emoji_id=MAIN_EMOJI["withdraw_stars"], style="success"),
+            reply_button(menu_text("sell_stars", language), emoji_id=MAIN_EMOJI["sell_stars"], style="success"),
+            reply_button(menu_text("profile", language), emoji_id=MAIN_EMOJI["profile"], style="success"),
         ],
         [
-            reply_button("Калькулятор", emoji_id=MAIN_EMOJI["calculator"], style="primary"),
-            reply_button("Відгуки", emoji_id=MAIN_EMOJI["reviews"], style="primary"),
-            reply_button("Підтримка", emoji_id=MAIN_EMOJI["support"], style="primary"),
+            reply_button(menu_text("calculator", language), emoji_id=MAIN_EMOJI["calculator"], style="primary"),
+            reply_button(menu_text("reviews", language), emoji_id=MAIN_EMOJI["reviews"], style="primary"),
+            reply_button(menu_text("support", language), emoji_id=MAIN_EMOJI["support"], style="primary"),
         ],
     ]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
@@ -1308,6 +1488,116 @@ async def replace_screen(
     )
     db.commit()
     return sent
+
+
+def language_kb():
+    b = InlineKeyboardBuilder()
+    for code, title in LANGUAGE_NAMES.items():
+        b.row(kb_button(title, emoji_id=EMOJI_POOL[0], style="primary", callback_data=f"lang:{code}"))
+    return b.as_markup()
+
+
+def subscription_kb():
+    b = InlineKeyboardBuilder()
+    for channel in parse_required_channels():
+        if channel["url"]:
+            b.row(kb_button(
+                f"Підписатися: {channel['title']}",
+                emoji_id=EMOJI_POOL[0],
+                style="primary",
+                url=channel["url"],
+            ))
+    b.row(kb_button(
+        "✅ Перевірити підписку",
+        emoji_id=EMOJI_POOL[5],
+        style="success",
+        callback_data="subscription:check",
+    ))
+    return b.as_markup()
+
+
+def subscription_gate_text():
+    channels = parse_required_channels()
+    channel_lines = "\n".join(f"• {esc(channel['title'])}" for channel in channels)
+    return (
+        "🔒 <b>Спочатку підпишіться на наші Telegram-канали</b>\n\n"
+        f"{channel_lines}\n\n"
+        "Після підписки натисніть «Перевірити підписку»."
+    )
+
+
+async def is_user_subscribed(user_id, bot_instance=None):
+    channels = parse_required_channels()
+    if not channels:
+        return True
+    bot_instance = bot_instance or bot
+    for channel in channels:
+        try:
+            member = await bot_instance.get_chat_member(channel["chat_id"], user_id)
+            if member.status not in ("creator", "administrator", "member") and not (
+                member.status == "restricted" and member.is_member
+            ):
+                return False
+        except Exception as error:
+            # A missing admin permission must fail closed: users should not
+            # get access when Telegram cannot verify the channel membership.
+            print(
+                f"Subscription check failed for {channel['chat_id']}: "
+                f"{type(error).__name__}: {error}",
+                flush=True,
+            )
+            return False
+    return True
+
+
+async def show_subscription_gate(user_id):
+    await replace_screen(
+        user_id,
+        subscription_gate_text(),
+        image="welcome",
+        reply_markup=subscription_kb(),
+        screen_key="subscription_gate",
+    )
+
+
+async def show_language_picker(user_id):
+    await replace_screen(
+        user_id,
+        "🌐 <b>Оберіть мову інтерфейсу / Choose interface language</b>",
+        image="welcome",
+        reply_markup=language_kb(),
+        screen_key="language_picker",
+    )
+
+
+async def show_welcome(user_id):
+    language = user_language(user_id)
+    welcome_text = {
+        "uk": (
+            f"{pe(WELCOME_EMOJI['stars'], '⭐')} <b>Вітаємо у {BOT_NAME}!</b>\n\n"
+            f"{pe(WELCOME_EMOJI['stars'], '⭐')} Купуйте Stars\n"
+            f"{pe(WELCOME_EMOJI['ton'], '🪙')} Купуйте TON\n"
+            f"{pe(WELCOME_EMOJI['fire'], '🔥')} Обирайте NFT та інші цифрові товари\n\n"
+            "Швидко, зручно та без зайвих кроків.\n\n"
+            "Оберіть потрібний розділ нижче 👇"
+        ),
+        "ru": (
+            f"{pe(WELCOME_EMOJI['stars'], '⭐')} <b>Добро пожаловать в {BOT_NAME}!</b>\n\n"
+            "⭐ Покупайте Stars\n🪙 Покупайте TON\n🔥 Выбирайте NFT и другие цифровые товары\n\n"
+            "Быстро, удобно и без лишних шагов.\n\nВыберите нужный раздел ниже 👇"
+        ),
+        "en": (
+            f"{pe(WELCOME_EMOJI['stars'], '⭐')} <b>Welcome to {BOT_NAME}!</b>\n\n"
+            "⭐ Buy Stars\n🪙 Buy TON\n🔥 Choose NFTs and other digital goods\n\n"
+            "Fast, convenient and simple.\n\nChoose a section below 👇"
+        ),
+    }[language]
+    await replace_screen(
+        user_id,
+        welcome_text,
+        image="welcome",
+        reply_markup=main_menu(language),
+    )
 
 
 def cancel_kb():
@@ -1546,6 +1836,36 @@ _last_start_at: dict[int, float] = {}
 START_DEDUP_SECONDS = 2.0
 
 
+class SubscriptionMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        if not user or user.id in ADMIN_IDS:
+            return await handler(event, data)
+
+        callback_data = getattr(event, "data", "") or ""
+        message_text = getattr(event, "text", "") or ""
+        is_start = message_text.startswith("/start")
+        is_subscription_flow = (
+            callback_data == "subscription:check"
+            or callback_data.startswith("lang:")
+        )
+        if is_start or is_subscription_flow:
+            return await handler(event, data)
+
+        bot_instance = data.get("bot") or bot
+        if await is_user_subscribed(user.id, bot_instance):
+            return await handler(event, data)
+
+        if isinstance(event, CallbackQuery):
+            await event.answer("Спочатку підпишіться на канал.", show_alert=True)
+        await show_subscription_gate(user.id)
+        return None
+
+
+dp.message.outer_middleware(SubscriptionMiddleware())
+dp.callback_query.outer_middleware(SubscriptionMiddleware())
+
+
 @dp.errors()
 async def ignore_forbidden_delivery(event: ErrorEvent):
     if isinstance(event.exception, TelegramForbiddenError):
@@ -1619,17 +1939,48 @@ async def start(message: Message, state: FSMContext):
         _processed_start_messages.clear()
     ensure_user(message.from_user)
     await state.clear()
-    await replace_screen(
+    register_referral(
         message.from_user.id,
-        f"{pe(WELCOME_EMOJI['stars'], '⭐')} <b>Вітаємо у {BOT_NAME}!</b>\n\n"
-        f"{pe(WELCOME_EMOJI['stars'], '⭐')} Купуйте Stars\n"
-        f"{pe(WELCOME_EMOJI['ton'], '🪙')} Купуйте TON\n"
-        f"{pe(WELCOME_EMOJI['fire'], '🔥')} Обирайте NFT та інші цифрові товари\n\n"
-        "Швидко, зручно та без зайвих кроків.\n\n"
-        "Оберіть потрібний розділ нижче 👇",
-        image="welcome",
-        reply_markup=main_menu(),
+        referral_start_id(message.text or ""),
     )
+    if not await is_user_subscribed(message.from_user.id):
+        await show_subscription_gate(message.from_user.id)
+        return
+    if not user_row(message.from_user.id)["language_code"]:
+        await show_language_picker(message.from_user.id)
+        return
+    await show_welcome(message.from_user.id)
+
+
+@dp.callback_query(F.data == "subscription:check")
+async def check_subscription(call: CallbackQuery):
+    await call.answer()
+    if not await is_user_subscribed(call.from_user.id):
+        await show_subscription_gate(call.from_user.id)
+        return
+    if not user_row(call.from_user.id)["language_code"]:
+        await show_language_picker(call.from_user.id)
+    else:
+        await show_welcome(call.from_user.id)
+
+
+@dp.callback_query(F.data.startswith("lang:"))
+async def choose_language(call: CallbackQuery):
+    language = call.data.split(":", 1)[1]
+    if language not in LANGUAGE_NAMES:
+        await call.answer("Невідома мова.", show_alert=True)
+        return
+    if not await is_user_subscribed(call.from_user.id):
+        await call.answer("Спочатку підпишіться на канал.", show_alert=True)
+        await show_subscription_gate(call.from_user.id)
+        return
+    db.execute(
+        "UPDATE users SET language_code=? WHERE id=?",
+        (language, call.from_user.id),
+    )
+    db.commit()
+    await call.answer(f"Обрано: {LANGUAGE_NAMES[language]}")
+    await show_welcome(call.from_user.id)
 
 
 @dp.message(Command("id"))
@@ -1647,8 +1998,7 @@ async def admin(message: Message):
     await message.answer("⚙️ <b>Адмін-панель</b>", reply_markup=admin_menu_kb())
 
 
-@dp.message(F.text == "Скасувати")
-@dp.message(F.text == "❌ Скасувати")
+@dp.message(F.text.in_({"Скасувати", "❌ Скасувати", "Cancel", "Отмена"}))
 async def cancel_state(message: Message, state: FSMContext):
     await state.clear()
     if message.from_user.id in ADMIN_IDS:
@@ -1657,7 +2007,7 @@ async def cancel_state(message: Message, state: FSMContext):
         message.from_user.id,
         "✅ Дію скасовано.\n\nОберіть потрібний розділ нижче 👇",
         image="welcome",
-        reply_markup=main_menu(),
+        reply_markup=main_menu(user_language(message.from_user.id)),
     )
 
 
@@ -1669,11 +2019,11 @@ async def back_main(call: CallbackQuery, state: FSMContext):
         call.from_user.id,
         "🏠 <b>Головне меню</b>\n\nОберіть потрібний розділ нижче 👇",
         image="welcome",
-        reply_markup=main_menu(),
+        reply_markup=main_menu(user_language(call.from_user.id)),
     )
 
 
-@dp.message(F.text == "Купити Stars")
+@dp.message(F.text.in_(set(MENU_LABELS["buy_stars"].values())))
 async def buy_stars(message: Message):
     rate = float(setting("stars_rate"))
     await replace_screen(
@@ -1745,7 +2095,12 @@ async def choose_payment(call: CallbackQuery):
     oid = int(oid_s)
     order = db.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
     if not order or order["user_id"] != call.from_user.id:
-        await replace_screen(call.from_user.id, "❌ Замовлення не знайдено.", image="stars", reply_markup=main_menu())
+        await replace_screen(
+            call.from_user.id,
+            "❌ Замовлення не знайдено.",
+            image="stars",
+            reply_markup=main_menu(user_language(call.from_user.id)),
+        )
         return
     if method != "ua":
         return
@@ -1793,7 +2148,7 @@ async def back_payment(call: CallbackQuery):
             call.from_user.id,
             "❌ Замовлення більше недоступне.",
             image="stars",
-            reply_markup=main_menu(),
+            reply_markup=main_menu(user_language(call.from_user.id)),
         )
         return
     await replace_screen(
@@ -1819,7 +2174,7 @@ async def receipt_start(call: CallbackQuery, state: FSMContext):
             call.from_user.id,
             "❌ Спочатку оберіть банк для цього замовлення.",
             image="stars",
-            reply_markup=main_menu(),
+            reply_markup=main_menu(user_language(call.from_user.id)),
         )
         return
     await state.update_data(receipt_order=oid)
@@ -1932,7 +2287,7 @@ async def save_receipt(
         f"{pe(EMOJI_POOL[5], '✅')} Квитанцію отримано.\n"
         f"📦 Замовлення #{oid} передано на перевірку.",
         image="stars",
-        reply_markup=main_menu(),
+        reply_markup=main_menu(user_language(message.from_user.id)),
     )
     u = user_row(message.from_user.id)
     text = (
@@ -1992,7 +2347,7 @@ async def save_receipt(
             "⚠️ Квитанцію збережено, але повідомлення адміністратору не доставлено.\n"
             "Перевірте, що ваш Telegram ID доданий у ADMIN_IDS, а адмін відкрив боту "
             "та натиснув /start.",
-            reply_markup=main_menu(),
+            reply_markup=main_menu(user_language(message.from_user.id)),
         )
 
 
@@ -2039,12 +2394,11 @@ async def cancel_order(call: CallbackQuery):
         call.from_user.id,
         "❌ Дію скасовано.\n\nОберіть потрібний розділ нижче 👇",
         image="welcome",
-        reply_markup=main_menu(),
+        reply_markup=main_menu(user_language(call.from_user.id)),
     )
 
 
-@dp.message(F.text == "Купити Gram")
-@dp.message(F.text == "Купити TON")
+@dp.message(F.text.in_({"Купити Gram", *MENU_LABELS["buy_ton"].values()}))
 async def buy_ton(message: Message, state: FSMContext):
     await state.set_state(Form.ton_amount)
     await replace_screen(
@@ -2084,7 +2438,7 @@ async def ton_amount(message: Message, state: FSMContext):
     )
 
 
-@dp.message(F.text == "Вивести Stars")
+@dp.message(F.text.in_(set(MENU_LABELS["withdraw_stars"].values())))
 async def withdraw(message: Message, state: FSMContext):
     ensure_user(message.from_user)
     u = user_row(message.from_user.id)
@@ -2098,7 +2452,7 @@ async def withdraw(message: Message, state: FSMContext):
             f"Ваш баланс: <b>{balance} Stars</b>\n"
             f"Мінімум для виводу: <b>{minimum} Stars</b>.",
             image="withdraw",
-            reply_markup=main_menu(),
+            reply_markup=main_menu(user_language(message.from_user.id)),
         )
         return
     await state.set_state(Form.withdraw)
@@ -2153,7 +2507,7 @@ async def withdraw_amount(message: Message, state: FSMContext):
         f"{pe(EMOJI_POOL[5], '✅')} Запит на вивід <b>#{oid}</b> створено.\n"
         "⏳ Очікуйте обробки заявки адміністратором.",
         image="withdraw",
-        reply_markup=main_menu(),
+        reply_markup=main_menu(user_language(message.from_user.id)),
     )
     await notify_admins(
         f"📤 <b>Запит на вивід #{oid}</b>\n"
@@ -2164,7 +2518,7 @@ async def withdraw_amount(message: Message, state: FSMContext):
     )
 
 
-@dp.message(F.text == "Продати Stars")
+@dp.message(F.text.in_(set(MENU_LABELS["sell_stars"].values())))
 async def sell_stars(message: Message, state: FSMContext):
     await state.set_state(Form.sell_stars)
     await replace_screen(
@@ -2195,11 +2549,11 @@ async def sell_stars_amount(message: Message, state: FSMContext):
         f"{pe(EMOJI_POOL[5], '✅')} Запит на продаж <b>{amount} Stars</b> прийнято.\n"
         f"🆘 Для отримання реквізитів зверніться до підтримки: {esc(setting('support'))}",
         image="sell",
-        reply_markup=main_menu(),
+        reply_markup=main_menu(user_language(message.from_user.id)),
     )
 
 
-@dp.message(F.text == "NFT")
+@dp.message(F.text.in_(set(MENU_LABELS["nft"].values())))
 async def nft_list(message: Message):
     rows = db.execute("SELECT * FROM nfts WHERE active=1 ORDER BY id DESC").fetchall()
     if not rows:
@@ -2207,7 +2561,7 @@ async def nft_list(message: Message):
             message.from_user.id,
             "🎁 Наразі доступних NFT немає.",
             image="nft",
-            reply_markup=main_menu(),
+            reply_markup=main_menu(user_language(message.from_user.id)),
         )
         return
     b = InlineKeyboardBuilder()
@@ -2237,7 +2591,7 @@ async def nft_buy(call: CallbackQuery):
             call.from_user.id,
             "❌ Цей NFT більше недоступний.",
             image="nft",
-            reply_markup=main_menu(),
+            reply_markup=main_menu(user_language(call.from_user.id)),
         )
         return
     oid = create_order(call.from_user.id, "nft", r["title"], r["price"], nft_id=nid)
@@ -2258,10 +2612,12 @@ async def nft_buy(call: CallbackQuery):
     )
 
 
-@dp.message(F.text == "Профіль")
+@dp.message(F.text.in_(set(MENU_LABELS["profile"].values())))
 async def profile(message: Message):
     ensure_user(message.from_user)
     u = user_row(message.from_user.id)
+    bot_info = await bot.get_me()
+    user_referral_link = referral_link(bot_info.username, u["id"])
     await replace_screen(
         message.from_user.id,
         f"{pe(MAIN_EMOJI['profile'], '👤')} <b>Ваш профіль</b>\n\n"
@@ -2271,16 +2627,18 @@ async def profile(message: Message):
         f"📊 Статус: <b>{esc(u['status'])}</b>\n"
         f"⭐ Придбано Stars: {u['bought_stars']}\n"
         f"💎 Придбано TON: {u['bought_ton']}\n"
-        f"🚀 Premium: {u['premium_months']} міс.\n"
         f"💰 Витрачено: {u['spent_uah']:.2f} грн\n"
         f"👥 Запрошено друзів: {u['invited']}\n"
+        f"🎁 Зароблено з рефералів: <b>{u['referral_earned_stars']} Stars</b>\n\n"
+        f"🔗 <b>Ваша реферальна ссылка:</b>\n<code>{esc(user_referral_link)}</code>\n"
+        "Отправьте её друзьям: вы получите 10% Stars с их подтверждённых покупок.\n"
         f"📅 Дата реєстрації: <b>{u['registered_at']}</b>",
         image="welcome",
-        reply_markup=main_menu(),
+        reply_markup=main_menu(user_language(message.from_user.id)),
     )
 
 
-@dp.message(F.text == "Калькулятор")
+@dp.message(F.text.in_(set(MENU_LABELS["calculator"].values())))
 async def calculator(message: Message, state: FSMContext):
     await state.set_state(Form.calculator)
     await replace_screen(
@@ -2311,11 +2669,11 @@ async def calculator_value(message: Message, state: FSMContext):
         message.from_user.id,
         f"🧮 <b>Розрахунок</b>\n\n⭐ Stars: <b>{stars}</b>\n💰 Вартість: <b>{amount:.2f} грн</b>",
         image="calculator",
-        reply_markup=main_menu(),
+        reply_markup=main_menu(user_language(message.from_user.id)),
     )
 
 
-@dp.message(F.text == "Відгуки")
+@dp.message(F.text.in_(set(MENU_LABELS["reviews"].values())))
 async def reviews(message: Message):
     b = InlineKeyboardMarkup(inline_keyboard=[[
         kb_button("Переглянути відгуки", emoji_id=MAIN_EMOJI["reviews"], style="primary", url=setting("reviews_url"))
@@ -2329,7 +2687,7 @@ async def reviews(message: Message):
     )
 
 
-@dp.message(F.text == "Підтримка")
+@dp.message(F.text.in_(set(MENU_LABELS["support"].values())))
 async def support(message: Message, state: FSMContext):
     await state.set_state(Form.support)
     await replace_screen(
@@ -2370,7 +2728,7 @@ async def support_message(message: Message, state: FSMContext):
         message.from_user.id,
         "✅ Звернення передано в підтримку.",
         image="support",
-        reply_markup=main_menu(),
+        reply_markup=main_menu(user_language(message.from_user.id)),
     )
 
 
@@ -3786,6 +4144,8 @@ async def admin_ok(call: CallbackQuery):
     oid = int(call.data.split(":")[1])
     stars_credited = None
     raffle_offer = None
+    referral_bonus = 0
+    referrer_id = None
     try:
         db.execute("BEGIN IMMEDIATE")
         order = db.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
@@ -3808,6 +4168,11 @@ async def admin_ok(call: CallbackQuery):
                 """UPDATE users SET balance_stars=balance_stars+?, bought_stars=bought_stars+?,
                    spent_uah=spent_uah+?, status='Клієнт' WHERE id=?""",
                 (stars_credited, purchased_stars, order["amount"], order["user_id"]),
+            )
+            referrer_id, referral_bonus = credit_referral_bonus(
+                oid,
+                order["user_id"],
+                purchased_stars,
             )
         elif order["order_type"] == "buy_ton":
             db.execute("UPDATE orders SET status='completed' WHERE id=?", (oid,))
@@ -3844,7 +4209,25 @@ async def admin_ok(call: CallbackQuery):
             f"⭐ На баланс зараховано: <b>{stars_credited} Stars</b>\n"
             f"💳 Поточний баланс: <b>{current_balance} Stars</b>"
         )
-        await bot.send_message(order["user_id"], user_text, reply_markup=main_menu())
+        await bot.send_message(
+            order["user_id"],
+            user_text,
+            reply_markup=main_menu(user_language(order["user_id"])),
+        )
+        if referrer_id and referral_bonus:
+            try:
+                await bot.send_message(
+                    referrer_id,
+                    f"🎉 За покупку вашого реферала нараховано "
+                    f"<b>{referral_bonus} Stars</b> (10%).\n"
+                    f"⭐ Поточний баланс: <b>{user_row(referrer_id)['balance_stars']} Stars</b>",
+                    reply_markup=main_menu(user_language(referrer_id)),
+                )
+            except Exception as error:
+                print(
+                    f"Referral notification failed for {referrer_id}: {error}",
+                    flush=True,
+                )
 
         if raffle_offer:
             current = db.execute(
@@ -3861,7 +4244,7 @@ async def admin_ok(call: CallbackQuery):
         await bot.send_message(
             order["user_id"],
             f"{pe(EMOJI_POOL[5], '✅')} <b>Замовлення #{oid} підтверджено!</b>",
-            reply_markup=main_menu(),
+            reply_markup=main_menu(user_language(order["user_id"])),
         )
 
     if order["order_type"] == "nft" and order["nft_id"]:
@@ -3934,7 +4317,7 @@ async def fallback(message: Message, state: FSMContext):
             return
     await message.answer(
         "🤔 Не вдалося розпізнати команду. Оберіть потрібний розділ у меню.",
-        reply_markup=main_menu(),
+        reply_markup=main_menu(user_language(message.from_user.id)),
     )
 
 
