@@ -31,6 +31,7 @@ from aiogram.types import (
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
+    Update,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiohttp import ClientSession, ClientTimeout, web
@@ -75,6 +76,11 @@ try:
     KEEPALIVE_INTERVAL = max(300, int(os.getenv("KEEPALIVE_INTERVAL", "600")))
 except ValueError:
     KEEPALIVE_INTERVAL = 600
+WEBHOOK_URL = (
+    os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL") or ""
+).strip().rstrip("/")
+WEBHOOK_PATH = "/telegram/webhook"
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 
 BANK_DETAILS = {
     "private": os.getenv("PRIVATE_DETAILS", "Реквізити Privat24 не налаштовані."),
@@ -3921,9 +3927,24 @@ async def start_health_server():
     async def health(_request):
         return web.Response(text="Spanix Stars Bot is running")
 
+    async def telegram_webhook(request):
+        if WEBHOOK_SECRET and request.headers.get(
+            "X-Telegram-Bot-Api-Secret-Token"
+        ) != WEBHOOK_SECRET:
+            return web.Response(status=403, text="forbidden")
+        try:
+            update = Update.model_validate(await request.json())
+            await dp.feed_update(bot, update)
+        except Exception as error:
+            print(f"Telegram webhook failed: {type(error).__name__}: {error}")
+            return web.Response(status=500, text="webhook error")
+        return web.Response(text="ok")
+
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
+    if WEBHOOK_URL:
+        app.router.add_post(WEBHOOK_PATH, telegram_webhook)
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.getenv("PORT", "8765"))
@@ -3955,6 +3976,18 @@ async def keepalive_loop():
                 print(f"Self-ping failed: {type(error).__name__}: {error}")
 
 
+async def configure_webhook():
+    webhook_url = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
+    webhook_options = {
+        "url": webhook_url,
+        "drop_pending_updates": False,
+    }
+    if WEBHOOK_SECRET:
+        webhook_options["secret_token"] = WEBHOOK_SECRET
+    await bot.set_webhook(**webhook_options)
+    print(f"Telegram webhook configured: {webhook_url}")
+
+
 async def main():
     if not BOT_TOKEN:
         raise RuntimeError("Не задано BOT_TOKEN у Replit Secrets.")
@@ -3969,21 +4002,26 @@ async def main():
         health_runner = await start_health_server()
         keepalive_task = asyncio.create_task(keepalive_loop())
         await configure_bot_commands()
-        retry_delay = 2
-        while True:
-            try:
-                await dp.start_polling(bot)
-                retry_delay = 2
-                print("Telegram polling stopped; restarting.")
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                print(
-                    f"Telegram polling failed: {type(error).__name__}: {error}. "
-                    f"Retrying in {retry_delay}s."
-                )
-            await asyncio.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, 60)
+        if WEBHOOK_URL:
+            await configure_webhook()
+            await asyncio.Event().wait()
+        else:
+            await bot.delete_webhook(drop_pending_updates=False)
+            retry_delay = 2
+            while True:
+                try:
+                    await dp.start_polling(bot)
+                    retry_delay = 2
+                    print("Telegram polling stopped; restarting.")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    print(
+                        f"Telegram polling failed: {type(error).__name__}: {error}. "
+                        f"Retrying in {retry_delay}s."
+                    )
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 60)
     finally:
         if keepalive_task is not None:
             keepalive_task.cancel()
