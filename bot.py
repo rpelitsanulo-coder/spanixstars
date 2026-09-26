@@ -980,6 +980,7 @@ CREATE TABLE IF NOT EXISTS orders (
     status TEXT DEFAULT 'waiting_payment',
     created_at TEXT NOT NULL,
     admin_note TEXT,
+    ton_address TEXT,
     nft_id INTEGER
 );
 
@@ -1085,6 +1086,7 @@ def ensure_column(table: str, column: str, definition: str):
         db.commit()
 
 
+ensure_column("orders", "ton_address", "TEXT")
 ensure_column("orders", "nft_id", "INTEGER")
 ensure_column("orders", "receipt_ocr_text", "TEXT")
 ensure_column("orders", "receipt_data_json", "TEXT")
@@ -1268,6 +1270,11 @@ UI_TRANSLATIONS = {
         "Оновити": "Обновить",
         "Підписатися:": "Подписаться:",
         "Перевірити підписку": "Проверить подписку",
+        "Вкажіть TON-адресу, на яку потрібно відправити придбані TON.": "Укажите TON-адрес, на который отправить купленные TON.",
+        "Перевірте адресу уважно — перекази в блокчейні незворотні.": "Проверьте адрес внимательно — переводы в блокчейне необратимы.",
+        "Некоректна TON-адреса.": "Некорректный TON-адрес.",
+        "Адреса отримання:": "Адрес получения:",
+        "TON буде відправлено на адресу:": "TON будут отправлены на адрес:",
         "Спочатку підпишіться на наші Telegram-канали": "Сначала подпишитесь на наши Telegram-каналы",
         "Після підписки натисніть «Перевірити підписку».": "После подписки нажмите «Проверить подписку».",
         "До оплати:": "К оплате:",
@@ -1336,6 +1343,11 @@ UI_TRANSLATIONS = {
         "Оновити": "Refresh",
         "Підписатися:": "Subscribe:",
         "Перевірити підписку": "Check subscription",
+        "Вкажіть TON-адресу, на яку потрібно відправити придбані TON.": "Enter the TON address where the purchased TON should be sent.",
+        "Перевірте адресу уважно — перекази в блокчейні незворотні.": "Check the address carefully — blockchain transfers cannot be reversed.",
+        "Некоректна TON-адреса.": "Invalid TON address.",
+        "Адреса отримання:": "Receiving address:",
+        "TON буде відправлено на адресу:": "TON will be sent to:",
         "Спочатку підпишіться на наші Telegram-канали": "Subscribe to our Telegram channels first",
         "Після підписки натисніть «Перевірити підписку».": "After subscribing, press “Check subscription”.",
         "До оплати:": "Amount to pay:",
@@ -1471,14 +1483,34 @@ def find_user_by_identifier(identifier):
     ).fetchone()
 
 
-def create_order(uid, order_type, quantity, amount, nft_id=None):
+def create_order(uid, order_type, quantity, amount, nft_id=None, ton_address=None):
     cur = db.execute(
-        """INSERT INTO orders(user_id,order_type,quantity,amount,status,created_at,nft_id)
-           VALUES(?,?,?,?,?,?,?)""",
-        (uid, order_type, str(quantity), float(amount), "waiting_payment", now(), nft_id),
+        """INSERT INTO orders(
+               user_id,order_type,quantity,amount,status,created_at,ton_address,nft_id
+           ) VALUES(?,?,?,?,?,?,?,?)""",
+        (
+            uid, order_type, str(quantity), float(amount),
+            "waiting_payment", now(), ton_address, nft_id,
+        ),
     )
     db.commit()
     return cur.lastrowid
+
+
+TON_FRIENDLY_ADDRESS_RE = re.compile(r"^[A-Za-z0-9_-]{48}$")
+TON_RAW_ADDRESS_RE = re.compile(r"^(?:0|-1):[0-9a-fA-F]{64}$")
+
+
+def normalize_ton_address(raw_value):
+    return re.sub(r"\s+", "", (raw_value or "").strip())
+
+
+def is_valid_ton_address(raw_value):
+    address = normalize_ton_address(raw_value)
+    return bool(
+        TON_FRIENDLY_ADDRESS_RE.fullmatch(address)
+        or TON_RAW_ADDRESS_RE.fullmatch(address)
+    )
 
 
 def credit_referral_bonus(order_id, buyer_id, purchased_stars):
@@ -2013,6 +2045,7 @@ def nft_admin_kb():
 class Form(StatesGroup):
     custom_stars = State()
     ton_amount = State()
+    ton_address = State()
     calculator = State()
     support = State()
     withdraw = State()
@@ -2504,6 +2537,11 @@ async def save_receipt(
         reply_markup=main_menu(user_language(message.from_user.id)),
     )
     u = user_row(message.from_user.id)
+    ton_address_line = (
+        f"📬 TON-адреса: <code>{esc(order['ton_address'])}</code>\n"
+        if order["order_type"] == "buy_ton" and order["ton_address"]
+        else ""
+    )
     text = (
         f"🔔 <b>Нове замовлення #{oid}</b>\n\n"
         f"👤 @{esc(u['username'] or 'без_username')}\n"
@@ -2511,6 +2549,7 @@ async def save_receipt(
         f"📦 {esc(order['order_type'])}: <b>{esc(order['quantity'])}</b>\n"
         f"💰 <b>{order['amount']:.2f} грн</b>\n"
         f"💳 {esc(order['payment_method'] or '—')}\n"
+        f"{ton_address_line}"
         f"🕒 {order['created_at']}\n\n"
         f"{receipt_summary(receipt_data, receipt_error)}"
     )
@@ -2628,7 +2667,7 @@ async def buy_ton(message: Message, state: FSMContext):
 @dp.message(Form.ton_amount)
 async def ton_amount(message: Message, state: FSMContext):
     try:
-        ton = float(message.text.replace(",", "."))
+        ton = float((message.text or "").replace(",", "."))
         if ton < 0.25:
             raise ValueError
     except (ValueError, AttributeError):
@@ -2640,12 +2679,45 @@ async def ton_amount(message: Message, state: FSMContext):
         )
         return
     amount = round(ton * float(setting("ton_rate")), 2)
-    oid = create_order(message.from_user.id, "buy_ton", ton, amount)
+    await state.update_data(ton_amount=ton, ton_amount_uah=amount)
+    await state.set_state(Form.ton_address)
+    await replace_screen(
+        message.from_user.id,
+        "📬 Вкажіть TON-адресу, на яку потрібно відправити придбані TON.\n\n"
+        "Приклад: <code>EQ...</code> або <code>UQ...</code>\n"
+        "Перевірте адресу уважно — перекази в блокчейні незворотні.",
+        image="ton",
+        reply_markup=cancel_kb(),
+    )
+
+
+@dp.message(Form.ton_address)
+async def ton_address(message: Message, state: FSMContext):
+    address = normalize_ton_address(message.text)
+    if not is_valid_ton_address(address):
+        await replace_screen(
+            message.from_user.id,
+            "❌ Некоректна TON-адреса. Надішліть повну адресу у форматі EQ... або UQ... (48 символів).",
+            image="ton",
+            reply_markup=cancel_kb(),
+        )
+        return
+    data = await state.get_data()
+    ton = float(data.get("ton_amount", 0))
+    amount = float(data.get("ton_amount_uah", round(ton * float(setting("ton_rate")), 2)))
+    oid = create_order(
+        message.from_user.id,
+        "buy_ton",
+        ton,
+        amount,
+        ton_address=address,
+    )
     await state.clear()
     await replace_screen(
         message.from_user.id,
         f"💳 До оплати: <b>{amount:.2f} грн</b>\n"
-        f"💎 Кількість: <b>{ton:g} TON</b>\n\n"
+        f"💎 Кількість: <b>{ton:g} TON</b>\n"
+        f"📬 Адреса отримання: <code>{esc(address)}</code>\n\n"
         "💳 Оберіть спосіб оплати:",
         image="ton",
         reply_markup=payment_kb(oid),
@@ -4226,6 +4298,11 @@ async def adm_orders(call: CallbackQuery):
         return
     for order in rows:
         u = user_row(order["user_id"])
+        ton_address_line = (
+            f"\n📬 TON-адреса: <code>{esc(order['ton_address'])}</code>"
+            if order["order_type"] == "buy_ton" and order["ton_address"]
+            else ""
+        )
         await call.message.answer(
             f"📦 <b>Замовлення #{order['id']}</b>\n"
             f"👤 @{esc(u['username'] or 'без_username')}\n"
@@ -4234,7 +4311,8 @@ async def adm_orders(call: CallbackQuery):
             f"📌 Кількість: {esc(order['quantity'])}\n"
             f"💰 Сума: <b>{order['amount']:.2f} грн</b>\n"
             f"📊 Статус: {esc(order['status'])}\n"
-            f"💳 Оплата: {esc(order['payment_method'] or '—')}",
+            f"💳 Оплата: {esc(order['payment_method'] or '—')}"
+            f"{ton_address_line}",
             reply_markup=admin_order_kb(order["id"]),
         )
 
@@ -4577,9 +4655,15 @@ async def admin_ok(call: CallbackQuery):
                     reply_markup=raffle_consent_kb(current["id"], oid),
                 )
     else:
+        confirmation_text = f"{pe(EMOJI_POOL[5], '✅')} <b>Замовлення #{oid} підтверджено!</b>"
+        if order["order_type"] == "buy_ton" and order["ton_address"]:
+            confirmation_text += (
+                f"\n\n💎 TON буде відправлено на адресу:\n"
+                f"<code>{esc(order['ton_address'])}</code>"
+            )
         await bot.send_message(
             order["user_id"],
-            f"{pe(EMOJI_POOL[5], '✅')} <b>Замовлення #{oid} підтверджено!</b>",
+            confirmation_text,
             reply_markup=main_menu(user_language(order["user_id"])),
         )
 
