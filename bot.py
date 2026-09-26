@@ -33,7 +33,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiohttp import web
+from aiohttp import ClientSession, ClientTimeout, web
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
@@ -70,6 +70,11 @@ if DB_PATH != ":memory:":
     DB_PATH = str(db_file.resolve())
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "@support")
 REVIEWS_URL = os.getenv("REVIEWS_URL", "https://t.me/")
+KEEPALIVE_URL = os.getenv("KEEPALIVE_URL", "").strip()
+try:
+    KEEPALIVE_INTERVAL = max(300, int(os.getenv("KEEPALIVE_INTERVAL", "600")))
+except ValueError:
+    KEEPALIVE_INTERVAL = 600
 
 BANK_DETAILS = {
     "private": os.getenv("PRIVATE_DETAILS", "Реквізити Privat24 не налаштовані."),
@@ -3927,6 +3932,29 @@ async def start_health_server():
     return runner
 
 
+async def keepalive_loop():
+    if not KEEPALIVE_URL:
+        print("Self-ping disabled: set KEEPALIVE_URL in Render Environment to enable it.")
+        return
+
+    timeout = ClientTimeout(total=20)
+    async with ClientSession(timeout=timeout) as session:
+        while True:
+            await asyncio.sleep(KEEPALIVE_INTERVAL)
+            try:
+                async with session.get(
+                    KEEPALIVE_URL,
+                    headers={"User-Agent": "Spanix-Stars-keepalive"},
+                ) as response:
+                    print(
+                        f"Self-ping {KEEPALIVE_URL}: HTTP {response.status}"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                print(f"Self-ping failed: {type(error).__name__}: {error}")
+
+
 async def main():
     if not BOT_TOKEN:
         raise RuntimeError("Не задано BOT_TOKEN у Replit Secrets.")
@@ -3936,8 +3964,10 @@ async def main():
     global bot
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     health_runner = None
+    keepalive_task = None
     try:
         health_runner = await start_health_server()
+        keepalive_task = asyncio.create_task(keepalive_loop())
         await configure_bot_commands()
         retry_delay = 2
         while True:
@@ -3955,6 +3985,9 @@ async def main():
             await asyncio.sleep(retry_delay)
             retry_delay = min(retry_delay * 2, 60)
     finally:
+        if keepalive_task is not None:
+            keepalive_task.cancel()
+            await asyncio.gather(keepalive_task, return_exceptions=True)
         if health_runner is not None:
             await health_runner.cleanup()
         await bot.session.close()
